@@ -247,6 +247,18 @@ const effortSchema = toolsByName.get('handoff_to_agent')?.inputSchema?.propertie
 if (effortSchema?.type !== 'string' || toolsByName.get('handoff_to_agent')?.inputSchema?.required?.includes('reasoning_effort')) {
   throw new Error(`handoff_to_agent did not expose optional typed reasoning_effort: ${JSON.stringify(effortSchema)}`);
 }
+for (const name of ['handoff_to_agent', 'handoff_to_codex']) {
+  const descriptor = toolsByName.get(name);
+  const expectedAnnotations = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
+  for (const [key, value] of Object.entries(expectedAnnotations)) {
+    if (descriptor?.annotations?.[key] !== value) {
+      throw new Error(`${name} tools/list annotation ${key} should be ${value}: ${JSON.stringify(descriptor?.annotations)}`);
+    }
+  }
+  if (!descriptor.description?.includes('replaces the existing plan') || !descriptor.description?.includes('append=true')) {
+    throw new Error(`${name} tools/list description does not explain replace/append behavior`);
+  }
+}
 if (toolsByName.get('bash')?.inputSchema?.properties?.timeout_ms?.maximum !== 900000) {
   throw new Error(`bash schema did not expose the stable 15-minute ceiling: ${JSON.stringify(toolsByName.get('bash')?.inputSchema)}`);
 }
