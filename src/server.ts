@@ -952,7 +952,7 @@ const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destru
 const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
-const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
+const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 
 export function createCodexProServer(
   config: CodexProConfig,
@@ -3011,7 +3011,7 @@ export function createCodexProServer(
     {
       title: "Handoff To Agent",
       description:
-        "Write .ai-bridge/current-plan.md for Codex, OpenCode, Pi, or another local implementation agent. This only creates handoff files; it does not execute local agent commands.",
+        "Write .ai-bridge/current-plan.md for Codex, OpenCode, Pi, or another local implementation agent. By default this replaces the existing plan; set append=true to append instead. This only writes handoff files; it does not execute the target agent, run shell commands, push code, or contact external services.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         agent: z.string().optional().describe("Target agent id, for example codex, opencode, pi, or custom. Default: custom."),
@@ -3081,7 +3081,7 @@ ${result.prompt}
     "handoff_to_codex",
     {
       title: "Handoff To Codex",
-      description: "Compatibility wrapper for handoff_to_agent with agent=codex.",
+      description: "Write .ai-bridge/current-plan.md for Codex. By default this replaces the existing plan; set append=true to append instead. This only writes handoff files; it does not execute Codex, run shell commands, push code, or contact external services.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         title: z.string().optional().describe("Short task title."),
