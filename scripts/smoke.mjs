@@ -247,6 +247,9 @@ for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_invento
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+if (toolsByName.get('handoff_to_agent')?.inputSchema?.properties?.reasoning_effort?.type !== 'string') {
+  throw new Error('handoff_to_agent schema did not expose reasoning_effort as a string');
+}
 if (toolsByName.get('bash')?.inputSchema?.properties?.timeout_ms?.maximum !== 900000) {
   throw new Error(`bash schema did not expose the stable 15-minute ceiling: ${JSON.stringify(toolsByName.get('bash')?.inputSchema)}`);
 }
@@ -1131,6 +1134,12 @@ const agentHandoff = await client.request('tools/call', {
   }
 });
 if (agentHandoff.structuredContent.agent !== 'opencode') throw new Error('handoff_to_agent did not preserve target agent');
+if (Object.hasOwn(agentHandoff.structuredContent, 'reasoning_effort')) {
+  throw new Error('handoff_to_agent did not preserve optional reasoning_effort compatibility');
+}
+if ((await fs.readFile(path.join(tmp, '.ai-bridge/current-plan.md'), 'utf8')).includes('Reasoning effort:')) {
+  throw new Error('handoff_to_agent added reasoning effort when omitted');
+}
 const escapedHandoff = await client.request('tools/call', {
   name: 'handoff_to_agent',
   arguments: {
@@ -1299,10 +1308,14 @@ if (linkedAdd.status !== 0) throw new Error(`Could not create linked worktree: $
 const linkedOpen = await client.request('tools/call', { name: 'open_workspace', arguments: { root: linkedRoot } });
 const linkedId = linkedOpen.structuredContent.workspace_id;
 const linkedHandoff = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
-  workspace_id: linkedId, agent: 'codex', title: 'Linked worktree handoff', plan: '- Work only in the linked target.'
+  workspace_id: linkedId, agent: 'codex', model: 'gpt-6-sol', reasoning_effort: 'high',
+  title: 'Linked worktree handoff', plan: '- Work only in the linked target.'
 } });
 if (linkedHandoff.isError) throw new Error(`Linked handoff failed: ${JSON.stringify(linkedHandoff)}`);
 const linkedData = linkedHandoff.structuredContent;
+if (linkedData.agent !== 'codex' || linkedData.model !== 'gpt-6-sol' || linkedData.reasoning_effort !== 'high') {
+  throw new Error(`Linked handoff lost typed routing fields: ${JSON.stringify(linkedData)}`);
+}
 const canonicalLinked = await fs.realpath(linkedRoot);
 if (linkedData.control_root !== await fs.realpath(tmp) || linkedData.target_root !== canonicalLinked ||
     !/^[0-9a-f]{64}$/.test(linkedData.plan_ref)) throw new Error('Linked handoff lost control or target identity');
@@ -1311,6 +1324,14 @@ const linkedMetadata = JSON.parse(await fs.readFile(path.join(linkedSlot, 'targe
 if (linkedMetadata.repositoryPath !== await fs.realpath(tmp) || linkedMetadata.worktreePath !== canonicalLinked ||
     !(await fs.readFile(path.join(linkedSlot, 'current-plan.md'), 'utf8')).includes('Linked worktree handoff')) {
   throw new Error('Linked handoff did not write its shared control slot');
+}
+const linkedPlan = await fs.readFile(path.join(linkedSlot, 'current-plan.md'), 'utf8');
+if (!/^Target agent: Codex \(codex\)\nModel: gpt-6-sol\nReasoning effort: high\n/m.test(linkedPlan)) {
+  throw new Error(`Linked handoff emitted an incompatible routing preamble: ${linkedPlan}`);
+}
+for (const logName of ['session-log.jsonl', 'execution-log.jsonl']) {
+  const entries = (await fs.readFile(path.join(linkedRoot, '.ai-bridge', logName), 'utf8')).trim().split('\n');
+  if (JSON.parse(entries.at(-1)).reasoning_effort !== 'high') throw new Error(`${logName} lost typed reasoning effort`);
 }
 if (await fs.readFile(path.join(tmp, '.ai-bridge/current-plan.md'), 'utf8') !== mainPlanBeforeLinked) {
   throw new Error('Linked handoff overwrote main control plan');
