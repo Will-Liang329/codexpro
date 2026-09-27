@@ -846,12 +846,39 @@ ${options.plan.trim()}
 `;
 }
 
-async function writeAgentHandoff(
+const CONTROL_PLAN_MAX_BYTES = 64 * 1024;
+
+function authoritativeHandoff(raw: string): {
+  agent: string; agentName: string; model?: string; reasoningEffort?: string;
+} {
+  const preamble = /^# [^\r\n]+\r?\n\r?\nUpdated: [^\r\n]+\r?\nWorkspace: [^\r\n]+\r?\nTarget agent: (.+) \(([^()\r\n]+)\)\r?\n(?:Model: ([^\r\n]+)\r?\n)?(?:Reasoning effort: ([^\r\n]+)\r?\n)?\r?\n## Plan(?:\r?\n|$)/u.exec(raw);
+  if (!preamble || [...raw.matchAll(/^Target agent:/gmu)].length !== 1) {
+    throw new CodexProError("Cannot append: existing handoff has no single authoritative routing preamble. Replace it instead.");
+  }
+  return { agentName: preamble[1]!.trim(), agent: preamble[2]!.trim(),
+    model: preamble[3]?.trim(), reasoningEffort: preamble[4]?.trim() };
+}
+
+function assertRenderedRouting(content: string, agent: string, model?: string, reasoningEffort?: string): void {
+  if ([...content.matchAll(/^Target agent:/gmu)].length !== 1) {
+    throw new CodexProError("Handoff must contain exactly one routing preamble.");
+  }
+  for (const [headerName, expected] of [
+    ["AHR-Agent", agent], ["AHR-Model", model], ["AHR-Reasoning-Effort", reasoningEffort]
+  ]) {
+    const header = new RegExp(`^\\s*${headerName}\\s*:\\s*(.+?)\\s*$`, "im").exec(content)?.[1]?.trim();
+    if (header !== undefined && header !== expected) {
+      throw new CodexProError(`Handoff ${headerName} conflicts with its routing preamble.`);
+    }
+  }
+}
+
+export async function writeAgentHandoff(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: {
-    agent: string;
+    agent?: string;
     agentName?: string;
     model?: string;
     reasoningEffort?: string;
@@ -859,6 +886,7 @@ async function writeAgentHandoff(
     plan: string;
     append: boolean;
     eventName: string;
+    beforePlanRename?: () => Promise<void> | void;
   }
 ): Promise<{
   agent: string;
@@ -878,11 +906,10 @@ async function writeAgentHandoff(
   planRef: string | null;
 }> {
   const control = await resolveHandoffControl(config, workspace);
-  await ensureAiBridge(config, guard, workspace, { createPlan: control.planRef === null });
-  const agent = normalizeAgentId(options.agent);
-  const agentName = displayAgentName(agent, options.agentName);
-  const model = options.model ? cleanOneLine(options.model, "", 120) : undefined;
-  const reasoningEffort = options.reasoningEffort ? cleanOneLine(options.reasoningEffort, "", 120) : undefined;
+  let agent = normalizeAgentId(options.agent);
+  let agentName = displayAgentName(agent, options.agentName);
+  let model = options.model ? cleanOneLine(options.model, "", 120) : undefined;
+  let reasoningEffort = options.reasoningEffort ? cleanOneLine(options.reasoningEffort, "", 120) : undefined;
   const plan = String(options.plan ?? "").trim();
   if (!plan) throw new CodexProError("plan must not be empty.");
   const planPath = control.planPath;
@@ -892,32 +919,48 @@ async function writeAgentHandoff(
   const diffPath = `${config.contextDir}/implementation-diff.patch`;
   const logPath = `${config.contextDir}/session-log.jsonl`;
   const executionLogPath = `${config.contextDir}/execution-log.jsonl`;
-  const body = buildAgentPlanBody({
-    title: options.title,
-    plan,
-    workspace,
-    agent,
-    agentName,
-    model,
-    reasoningEffort,
-    statusPath,
-    diffPath,
-    executionLogPath
+  const metadataPath = control.metadata === null ? null :
+    `${config.contextDir}/worktrees/${control.planRef}/target.json`;
+  const planAbsPath = guard.resolve(control.repository, planPath, { forWrite: true }).absPath;
+  const metadataAbsPath = metadataPath === null ? null :
+    guard.resolve(control.repository, metadataPath, { forWrite: true }).absPath;
+  const writeResult = await withFileWriteLocks([planAbsPath, ...(metadataAbsPath ? [metadataAbsPath] : [])], async () => {
+    let content: string;
+    if (options.append) {
+      const raw = await readRawTextFileBounded(config, guard, control.repository, planPath);
+      const existing = authoritativeHandoff(raw);
+      if (options.agent !== undefined && normalizeAgentId(options.agent) !== existing.agent) {
+        throw new CodexProError(`Cannot append: agent conflicts with existing routing (${existing.agent}).`);
+      }
+      if (model !== undefined && model !== existing.model) {
+        throw new CodexProError("Cannot append: model conflicts with existing routing.");
+      }
+      if (reasoningEffort !== undefined && reasoningEffort !== existing.reasoningEffort) {
+        throw new CodexProError("Cannot append: reasoning_effort conflicts with existing routing.");
+      }
+      ({ agent, agentName, model, reasoningEffort } = existing);
+      content = `${raw.trimEnd()}\n\n---\n\n## ${options.title}\n\n${plan}\n`;
+    } else {
+      content = buildAgentPlanBody({ title: options.title, plan, workspace, agent,
+        agentName, model, reasoningEffort, statusPath, diffPath, executionLogPath });
+    }
+    assertRenderedRouting(content, agent, model, reasoningEffort);
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes > CONTROL_PLAN_MAX_BYTES) {
+      throw new CodexProError(`Handoff exceeds the 64 KiB control-plan limit (${bytes} UTF-8 bytes).`);
+    }
+    await ensureAiBridge(config, guard, workspace, { createPlan: control.planRef === null });
+    // Metadata is complete before the plan rename. A missing or malformed target
+    // makes Router reject the slot; a newly visible plan always has its target.
+    if (control.metadata !== null && metadataPath !== null) {
+      await writeTextFile(config, guard, control.repository, metadataPath,
+        `${JSON.stringify(control.metadata, null, 2)}\n`,
+        { createDirs: true, overwrite: true, atomicReplace: true, lockHeld: true });
+    }
+    return writeTextFile(config, guard, control.repository, planPath, content,
+      { createDirs: true, overwrite: true, atomicReplace: true, lockHeld: true,
+        beforeAtomicRename: options.beforePlanRename });
   });
-
-  let content = body;
-  if (options.append) {
-    const raw = await readRawTextFileBounded(config, guard, control.repository, planPath);
-    content = `${raw.trimEnd()}\n\n---\n\n${body}`;
-  }
-
-  if (control.metadata !== null) {
-    const metadataPath = `${config.contextDir}/worktrees/${control.planRef}/target.json`;
-    await writeTextFile(config, guard, control.repository, metadataPath,
-      `${JSON.stringify(control.metadata, null, 2)}\n`, { createDirs: true, overwrite: true });
-  }
-  const writeResult = await writeTextFile(config, guard, control.repository, planPath, content,
-    { createDirs: true, overwrite: true });
   const event = {
     agent,
     agent_name: agentName,
@@ -3050,7 +3093,7 @@ export function createCodexProServer(
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const result = await writeAgentHandoff(config, guard, workspace, {
-        agent: args.agent ?? "custom",
+        agent: args.agent,
         agentName: args.agent_name,
         model: args.model,
         reasoningEffort: args.reasoning_effort,
@@ -3142,6 +3185,8 @@ ${result.prompt}
         root: workspace.root,
         agent: result.agent,
         agent_name: result.agentName,
+        model: result.model,
+        reasoning_effort: result.reasoningEffort,
         plan_path: result.planPath,
         control_root: result.controlRoot,
         target_root: result.targetRoot,

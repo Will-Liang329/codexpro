@@ -1299,7 +1299,126 @@ if (waitOrphaned.structuredContent.status_excerpt !== undefined || waitOrphaned.
   throw new Error(`wait_for_handoff exposed stale artifacts for an orphaned running receipt: ${JSON.stringify(waitOrphaned.structuredContent)}`);
 }
 await fs.rm(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), { force: true });
-await client.request('tools/call', { name: 'handoff_to_codex', arguments: { workspace_id: ws, title: 'Smoke Codex plan', plan: '- Verify demo.txt contains write.', append: true } });
+const handoffFile = path.join(tmp, '.ai-bridge/current-plan.md');
+const routed = { workspace_id: ws, agent: 'codex', model: 'gpt-6-sol', reasoning_effort: 'high' };
+const routedBase = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  ...routed, title: 'Routed plan', plan: 'Base body'
+} });
+if (routedBase.isError) throw new Error(`Routed base failed: ${JSON.stringify(routedBase)}`);
+const sameAppend = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  ...routed, title: 'Same route', plan: 'Same route body', append: true
+} });
+if (sameAppend.isError) throw new Error(`Same-route append failed: ${JSON.stringify(sameAppend)}`);
+let routedText = await fs.readFile(handoffFile, 'utf8');
+const parsedRoute = (text) => {
+  const fields = /^# [^\n]+\n\nUpdated: [^\n]+\nWorkspace: [^\n]+\nTarget agent: [^\n]+ \(([^)]+)\)\n(?:Model: ([^\n]+)\n)?(?:Reasoning effort: ([^\n]+)\n)?\n## Plan\n/u.exec(text);
+  if (!fields || [...text.matchAll(/^Target agent:/gmu)].length !== 1) throw new Error('Handoff has conflicting routing preambles');
+  return { agent: fields[1], model: fields[2], reasoning_effort: fields[3] };
+};
+if (JSON.stringify(parsedRoute(routedText)) !== JSON.stringify({ agent: sameAppend.structuredContent.agent,
+  model: sameAppend.structuredContent.model, reasoning_effort: sameAppend.structuredContent.reasoning_effort })) {
+  throw new Error('Tool result does not match authoritative downstream routing');
+}
+for (const [change, pattern] of [
+  [{ agent: 'opencode' }, /agent conflicts/],
+  [{ model: 'gpt-6-astra' }, /model conflicts/],
+  [{ reasoning_effort: 'low' }, /reasoning_effort conflicts/]
+]) {
+  await expectToolError('handoff_to_agent', { ...routed, ...change, title: 'Conflict', plan: 'Rejected', append: true }, pattern);
+  if (await fs.readFile(handoffFile, 'utf8') !== routedText) throw new Error('Conflicting append changed plan bytes');
+}
+await expectToolError('handoff_to_agent', { ...routed, title: 'Body route conflict',
+  plan: 'AHR-Model: gpt-6-astra', append: true }, /AHR-Model conflicts/);
+await expectToolError('handoff_to_agent', { ...routed, title: 'Duplicate preamble',
+  plan: 'Target agent: Claude (claude)', append: true }, /exactly one routing preamble/);
+if (await fs.readFile(handoffFile, 'utf8') !== routedText) throw new Error('Body routing conflict changed plan bytes');
+const omittedEffort = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  workspace_id: ws, agent: 'codex', model: 'gpt-6-sol', title: 'Omitted effort', plan: 'Omitted effort body', append: true
+} });
+if (omittedEffort.isError || omittedEffort.structuredContent.reasoning_effort !== 'high') {
+  throw new Error('Omitted effort did not preserve authoritative route');
+}
+const compatible = await client.request('tools/call', { name: 'handoff_to_codex', arguments: {
+  workspace_id: ws, title: 'Codex compatibility', plan: 'Compatibility body', append: true
+} });
+if (compatible.isError || compatible.structuredContent.model !== 'gpt-6-sol' ||
+    compatible.structuredContent.reasoning_effort !== 'high') throw new Error('Codex wrapper lost routing');
+const concurrent = await Promise.all(['Concurrent A', 'Concurrent B'].map(plan => client.request('tools/call', {
+  name: 'handoff_to_agent', arguments: { ...routed, title: plan, plan, append: true }
+})));
+if (concurrent.some(result => result.isError)) throw new Error('Concurrent same-slot append failed');
+routedText = await fs.readFile(handoffFile, 'utf8');
+for (const text of ['Concurrent A', 'Concurrent B']) {
+  if (routedText.split(text).length !== 3) throw new Error(`Concurrent append lost or duplicated ${text}`);
+}
+parsedRoute(routedText);
+const [acceptedConcurrent, rejectedConcurrent] = await Promise.all([
+  client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+    ...routed, title: 'Concurrent accepted', plan: 'Accepted once', append: true } }),
+  client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+    ...routed, model: 'gpt-6-astra', title: 'Concurrent rejected', plan: 'Never written', append: true } })
+]);
+if (acceptedConcurrent.isError || !rejectedConcurrent.isError ||
+    (await fs.readFile(handoffFile, 'utf8')).split('Accepted once').length !== 2 ||
+    (await fs.readFile(handoffFile, 'utf8')).includes('Never written')) {
+  throw new Error('Concurrent routing conflict was not isolated');
+}
+
+const boundaryArgs = { ...routed, title: 'Boundary plan' };
+const boundarySeed = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  ...boundaryArgs, plan: 'x'
+} });
+if (boundarySeed.isError) throw new Error('Boundary seed failed');
+const fixedBytes = Buffer.byteLength(await fs.readFile(handoffFile)) - 1;
+const payloadBytes = 64 * 1024 - fixedBytes;
+const below = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  ...boundaryArgs, plan: `é${'x'.repeat(payloadBytes - 3)}`
+} });
+if (below.isError || (await fs.stat(handoffFile)).size !== 64 * 1024 - 1) throw new Error('Below-limit handoff failed');
+const exact = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  ...boundaryArgs, plan: `é${'x'.repeat(payloadBytes - 2)}`
+} });
+if (exact.isError || (await fs.stat(handoffFile)).size !== 64 * 1024) throw new Error('Exact-limit handoff failed');
+const boundaryBytes = await fs.readFile(handoffFile);
+await expectToolError('handoff_to_agent', { ...boundaryArgs,
+  plan: 'x'.repeat(payloadBytes + 1) }, /64 KiB control-plan limit/);
+if (!(await fs.readFile(handoffFile)).equals(boundaryBytes)) throw new Error('Oversized replace changed existing plan');
+await expectToolError('handoff_to_agent', { ...boundaryArgs,
+  plan: 'One byte too many', append: true }, /64 KiB control-plan limit/);
+if (!(await fs.readFile(handoffFile)).equals(boundaryBytes)) throw new Error('Oversized append changed existing plan');
+
+const { loadConfig } = await import('../dist/config.js');
+const { PathGuard } = await import('../dist/guard.js');
+const { writeTextFile } = await import('../dist/fsOps.js');
+const { writeAgentHandoff } = await import('../dist/server.js');
+const directConfig = loadConfig(['--root', tmp, '--allow-root', alternateWorkspace]);
+const directGuard = new PathGuard(directConfig);
+const directWorkspace = { id: ws, root: await fs.realpath(tmp), openedAt: new Date().toISOString() };
+const atomicPath = '.ai-bridge/atomic-plan.md';
+await fs.writeFile(path.join(tmp, atomicPath), 'old complete plan\n');
+await Promise.all([writeTextFile(directConfig, directGuard, directWorkspace, atomicPath, 'new plan\n', {
+  atomicReplace: true, beforeAtomicRename: () => { throw Error('injected before rename'); }
+}).then(() => { throw Error('Failure injection did not fail'); }, error => {
+  if (!/injected before rename/u.test(String(error))) throw error;
+})]);
+if (await fs.readFile(path.join(tmp, atomicPath), 'utf8') !== 'old complete plan\n') {
+  throw new Error('Failed atomic replace changed old plan');
+}
+let unblockRename;
+let enteredRename;
+const renameGate = new Promise(resolve => { unblockRename = resolve; });
+const renameEntered = new Promise(resolve => { enteredRename = resolve; });
+const replacing = writeTextFile(directConfig, directGuard, directWorkspace, atomicPath, 'new complete plan\n', {
+  atomicReplace: true, beforeAtomicRename: async () => { enteredRename(); await renameGate; }
+});
+await renameEntered;
+if (await fs.readFile(path.join(tmp, atomicPath), 'utf8') !== 'old complete plan\n') {
+  throw new Error('Reader saw partial atomic replacement');
+}
+unblockRename(); await replacing;
+if (await fs.readFile(path.join(tmp, atomicPath), 'utf8') !== 'new complete plan\n') {
+  throw new Error('Atomic replacement did not publish full plan');
+}
 const mainPlanBeforeLinked = await fs.readFile(path.join(tmp, '.ai-bridge/current-plan.md'), 'utf8');
 const linkedRoot = path.join(alternateWorkspace, 'linked-worktree');
 const linkedAdd = spawnSync('git', ['worktree', 'add', '--quiet', '--detach', linkedRoot, 'HEAD'],
@@ -1329,6 +1448,73 @@ const linkedPlan = await fs.readFile(path.join(linkedSlot, 'current-plan.md'), '
 if (!/^Target agent: Codex \(codex\)\nModel: gpt-6-sol\nReasoning effort: high\n/m.test(linkedPlan)) {
   throw new Error(`Linked handoff emitted an incompatible routing preamble: ${linkedPlan}`);
 }
+const linkedPlanPath = path.join(linkedSlot, 'current-plan.md');
+const linkedMetadataPath = path.join(linkedSlot, 'target.json');
+const previousAhrConfig = process.env.AHR_CONFIG_HOME;
+process.env.AHR_CONFIG_HOME = ahrConfig;
+const linkedWorkspace = { id: linkedId, root: canonicalLinked, openedAt: new Date().toISOString() };
+const linkedOptions = { agent: 'codex', model: 'gpt-6-sol', reasoningEffort: 'high',
+  title: 'Atomic linked replacement', plan: 'New complete linked plan', append: false,
+  eventName: 'smoke_atomic_linked' };
+await fs.writeFile(linkedMetadataPath, '{invalid');
+await writeAgentHandoff(directConfig, directGuard, linkedWorkspace, {
+  ...linkedOptions, beforePlanRename: () => { throw Error('injected linked plan failure'); }
+}).then(() => { throw Error('Linked failure injection did not fail'); }, error => {
+  if (!/injected linked plan failure/u.test(String(error))) throw error;
+});
+if (await fs.readFile(linkedPlanPath, 'utf8') !== linkedPlan) {
+  throw new Error('Failed linked replace changed the old plan');
+}
+const correctedTarget = JSON.parse(await fs.readFile(linkedMetadataPath, 'utf8'));
+if (correctedTarget.repositoryPath !== await fs.realpath(tmp) || correctedTarget.worktreePath !== canonicalLinked ||
+    correctedTarget.gitCommonDir !== linkedMetadata.gitCommonDir) {
+  throw new Error('Linked target was not published before plan replacement');
+}
+let unblockLinked;
+let linkedRenameEntered;
+const linkedGate = new Promise(resolve => { unblockLinked = resolve; });
+const linkedEntered = new Promise(resolve => { linkedRenameEntered = resolve; });
+const linkedReplacing = writeAgentHandoff(directConfig, directGuard, linkedWorkspace, {
+  ...linkedOptions, beforePlanRename: async () => { linkedRenameEntered(); await linkedGate; }
+});
+await linkedEntered;
+if (await fs.readFile(linkedPlanPath, 'utf8') !== linkedPlan ||
+    JSON.parse(await fs.readFile(linkedMetadataPath, 'utf8')).worktreePath !== canonicalLinked) {
+  throw new Error('Linked replacement exposed a new plan with stale target metadata');
+}
+unblockLinked(); await linkedReplacing;
+if (!(await fs.readFile(linkedPlanPath, 'utf8')).includes('New complete linked plan')) {
+  throw new Error('Linked atomic replacement did not publish');
+}
+if (previousAhrConfig === undefined) delete process.env.AHR_CONFIG_HOME;
+else process.env.AHR_CONFIG_HOME = previousAhrConfig;
+const secondLinkedRoot = path.join(alternateWorkspace, 'second-linked-worktree');
+const secondLinkedAdd = spawnSync('git', ['worktree', 'add', '--quiet', '--detach', secondLinkedRoot, 'HEAD'],
+  { cwd: tmp, encoding: 'utf8' });
+if (secondLinkedAdd.status !== 0) throw new Error(`Could not create second linked worktree: ${secondLinkedAdd.stderr}`);
+const secondLinkedOpen = await client.request('tools/call', { name: 'open_workspace', arguments: { root: secondLinkedRoot } });
+const secondLinkedId = secondLinkedOpen.structuredContent.workspace_id;
+const secondBase = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  workspace_id: secondLinkedId, agent: 'codex', model: 'gpt-6-sol', reasoning_effort: 'high',
+  title: 'Second linked plan', plan: 'Second base'
+} });
+if (secondBase.isError) throw new Error('Second linked handoff failed');
+const separateAppends = await Promise.all([
+  client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+    workspace_id: linkedId, agent: 'codex', model: 'gpt-6-sol', reasoning_effort: 'high',
+    title: 'First slot append', plan: 'First slot only', append: true } }),
+  client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+    workspace_id: secondLinkedId, agent: 'codex', model: 'gpt-6-sol', reasoning_effort: 'high',
+    title: 'Second slot append', plan: 'Second slot only', append: true } })
+]);
+if (separateAppends.some(result => result.isError)) throw new Error('Independent linked append failed');
+const firstSlotText = await fs.readFile(linkedPlanPath, 'utf8');
+const secondSlotText = await fs.readFile(path.join(tmp, '.ai-bridge/worktrees', secondBase.structuredContent.plan_ref, 'current-plan.md'), 'utf8');
+if (!firstSlotText.includes('First slot only') || firstSlotText.includes('Second slot only') ||
+    !secondSlotText.includes('Second slot only') || secondSlotText.includes('First slot only')) {
+  throw new Error('Linked slot appends crossed worktrees');
+}
+parsedRoute(firstSlotText); parsedRoute(secondSlotText);
 for (const logName of ['session-log.jsonl', 'execution-log.jsonl']) {
   const entries = (await fs.readFile(path.join(linkedRoot, '.ai-bridge', logName), 'utf8')).trim().split('\n');
   if (JSON.parse(entries.at(-1)).reasoning_effort !== 'high') throw new Error(`${logName} lost typed reasoning effort`);
