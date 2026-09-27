@@ -96,8 +96,9 @@ export async function withFileWriteLocks<T>(absPaths: string[], task: () => Prom
   }
 }
 
-async function writeText(absPath: string, content: string, existingText?: string, relPath = path.basename(absPath)): Promise<void> {
-  if (existingText !== undefined) {
+async function writeText(absPath: string, content: string, existingText?: string, relPath = path.basename(absPath),
+  atomicReplace = false, beforeAtomicRename?: () => Promise<void> | void): Promise<void> {
+  if (existingText !== undefined && !atomicReplace) {
     const handle = await fsp.open(absPath, "r+");
     try {
       const currentText = await handle.readFile("utf8");
@@ -126,11 +127,13 @@ async function writeText(absPath: string, content: string, existingText?: string
   const tempPath = path.join(parent, `.${basename}.codexpro-${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
   let handle: fsp.FileHandle | undefined;
   try {
-    handle = await fsp.open(tempPath, "wx", 0o666);
+    const mode = existingText === undefined ? 0o666 : (await fsp.stat(absPath)).mode & 0o777;
+    handle = await fsp.open(tempPath, "wx", mode);
     await handle.writeFile(content, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await beforeAtomicRename?.();
     await fsp.rename(tempPath, absPath);
   } catch (error) {
     try {
@@ -354,7 +357,8 @@ export async function writeTextFile(
   workspace: Workspace,
   filePath: string,
   content: string,
-  options: { createDirs?: boolean; overwrite?: boolean; expectedSha256?: string } = {}
+  options: { createDirs?: boolean; overwrite?: boolean; expectedSha256?: string;
+    atomicReplace?: boolean; lockHeld?: boolean; beforeAtomicRename?: () => Promise<void> | void } = {}
 ): Promise<{ path: string; bytes: number; sha256: string; existed: boolean; diff: DiffResult }> {
   const resolved = guard.resolve(workspace, filePath, { forWrite: true });
   const contentBytes = Buffer.byteLength(content, "utf8");
@@ -365,7 +369,7 @@ export async function writeTextFile(
     throw new CodexProError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  const releaseWriteLock = await acquireFileWriteLock(resolved.absPath);
+  const releaseWriteLock = options.lockHeld ? () => {} : await acquireFileWriteLock(resolved.absPath);
   try {
     let oldText = "";
     let existed = false;
@@ -390,7 +394,8 @@ export async function writeTextFile(
     }
 
     const diff = makeUnifiedDiff(oldText, content, resolved.relPath);
-    await writeText(resolved.absPath, content, existed ? oldText : undefined, resolved.relPath);
+    await writeText(resolved.absPath, content, existed ? oldText : undefined, resolved.relPath,
+      options.atomicReplace, options.beforeAtomicRename);
     return { path: resolved.relPath, bytes: contentBytes, sha256: sha256(content), existed, diff };
   } finally {
     releaseWriteLock();
