@@ -218,6 +218,9 @@ const commitResult = spawnSync('git', ['-c', 'user.email=smoke@example.com', '-c
 if (commitResult.status !== 0) {
   throw new Error(`git commit failed: ${commitResult.stderr || commitResult.stdout}`);
 }
+const ahrConfig = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-ahr-config-'));
+await fs.writeFile(path.join(ahrConfig, 'workspaces.json'), JSON.stringify({ version: 1,
+  workspaces: [{ id: 'smoke', name: 'Smoke', path: await fs.realpath(tmp) }] }));
 
 const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--allow-root', alternateWorkspace, '--bash', 'safe', '--tool-mode', 'full'], {
   cwd: path.resolve('.'),
@@ -225,6 +228,7 @@ const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--al
     ...process.env,
     CODEXPRO_ROOT: tmp,
     CODEXPRO_ALLOWED_ROOTS: [tmp, alternateWorkspace].join(path.delimiter),
+    AHR_CONFIG_HOME: ahrConfig,
     CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test',
     CODEXPRO_TOOL_CARDS: '0'
   }
@@ -1287,6 +1291,44 @@ if (waitOrphaned.structuredContent.status_excerpt !== undefined || waitOrphaned.
 }
 await fs.rm(path.join(tmp, '.ai-bridge', 'handoff-run-state.json'), { force: true });
 await client.request('tools/call', { name: 'handoff_to_codex', arguments: { workspace_id: ws, title: 'Smoke Codex plan', plan: '- Verify demo.txt contains write.', append: true } });
+const mainPlanBeforeLinked = await fs.readFile(path.join(tmp, '.ai-bridge/current-plan.md'), 'utf8');
+const linkedRoot = path.join(alternateWorkspace, 'linked-worktree');
+const linkedAdd = spawnSync('git', ['worktree', 'add', '--quiet', '--detach', linkedRoot, 'HEAD'],
+  { cwd: tmp, encoding: 'utf8' });
+if (linkedAdd.status !== 0) throw new Error(`Could not create linked worktree: ${linkedAdd.stderr}`);
+const linkedOpen = await client.request('tools/call', { name: 'open_workspace', arguments: { root: linkedRoot } });
+const linkedId = linkedOpen.structuredContent.workspace_id;
+const linkedHandoff = await client.request('tools/call', { name: 'handoff_to_agent', arguments: {
+  workspace_id: linkedId, agent: 'codex', title: 'Linked worktree handoff', plan: '- Work only in the linked target.'
+} });
+if (linkedHandoff.isError) throw new Error(`Linked handoff failed: ${JSON.stringify(linkedHandoff)}`);
+const linkedData = linkedHandoff.structuredContent;
+const canonicalLinked = await fs.realpath(linkedRoot);
+if (linkedData.control_root !== await fs.realpath(tmp) || linkedData.target_root !== canonicalLinked ||
+    !/^[0-9a-f]{64}$/.test(linkedData.plan_ref)) throw new Error('Linked handoff lost control or target identity');
+const linkedSlot = path.join(await fs.realpath(tmp), '.ai-bridge/worktrees', linkedData.plan_ref);
+const linkedMetadata = JSON.parse(await fs.readFile(path.join(linkedSlot, 'target.json'), 'utf8'));
+if (linkedMetadata.repositoryPath !== await fs.realpath(tmp) || linkedMetadata.worktreePath !== canonicalLinked ||
+    !(await fs.readFile(path.join(linkedSlot, 'current-plan.md'), 'utf8')).includes('Linked worktree handoff')) {
+  throw new Error('Linked handoff did not write its shared control slot');
+}
+if (await fs.readFile(path.join(tmp, '.ai-bridge/current-plan.md'), 'utf8') !== mainPlanBeforeLinked) {
+  throw new Error('Linked handoff overwrote main control plan');
+}
+try { await fs.access(path.join(linkedRoot, '.ai-bridge/current-plan.md')); throw new Error('Created a local orphan plan'); }
+catch (error) { if (error?.code !== 'ENOENT') throw error; }
+try { await fs.access(path.join(linkedRoot, '.ai-bridge/handoff-run-state.json')); throw new Error('Handoff launched an agent directly'); }
+catch (error) { if (error?.code !== 'ENOENT') throw error; }
+if (JSON.parse(await fs.readFile(path.join(ahrConfig, 'workspaces.json'), 'utf8')).workspaces.length !== 1) {
+  throw new Error('Linked handoff auto-enrolled a worktree');
+}
+const unenrolledRoot = path.join(alternateWorkspace, 'unenrolled');
+await fs.mkdir(unenrolledRoot);
+const initUnenrolled = spawnSync('git', ['init', '--quiet', unenrolledRoot], { encoding: 'utf8' });
+if (initUnenrolled.status !== 0) throw new Error(initUnenrolled.stderr);
+const unenrolledOpen = await client.request('tools/call', { name: 'open_workspace', arguments: { root: unenrolledRoot } });
+await expectToolError('handoff_to_agent', { workspace_id: unenrolledOpen.structuredContent.workspace_id,
+  agent: 'codex', plan: '- No enrollment.' }, /not enrolled/);
 await fs.writeFile(path.join(tmp, '.ai-bridge', 'current-plan.md'), 'x'.repeat(190000), 'utf8');
 await expectToolError('handoff_to_agent', {
   workspace_id: ws,

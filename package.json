@@ -70,6 +70,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "check": "npm run build && npm run smoke",
     "prepack": "npm run build",
     "prepublishOnly": "node scripts/release-guard.mjs",
     "start": "node dist/stdio.js",

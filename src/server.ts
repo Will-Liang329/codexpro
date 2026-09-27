@@ -21,6 +21,7 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
+import { resolveHandoffControl } from "./handoffControl.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -868,14 +869,19 @@ async function writeAgentHandoff(
   executionLogPath: string;
   prompt: string;
   writeResult: Awaited<ReturnType<typeof writeTextFile>>;
+  controlRoot: string;
+  targetRoot: string;
+  planRef: string | null;
 }> {
-  await ensureAiBridge(config, guard, workspace);
+  const control = await resolveHandoffControl(config, workspace);
+  await ensureAiBridge(config, guard, workspace, { createPlan: control.planRef === null });
   const agent = normalizeAgentId(options.agent);
   const agentName = displayAgentName(agent, options.agentName);
   const model = options.model ? cleanOneLine(options.model, "", 120) : undefined;
   const plan = String(options.plan ?? "").trim();
   if (!plan) throw new CodexProError("plan must not be empty.");
-  const planPath = `${config.contextDir}/current-plan.md`;
+  const planPath = control.planPath;
+  const displayPlanPath = control.planRef === null ? planPath : path.join(control.repository.root, planPath);
   const statusPath = `${config.contextDir}/agent-status.md`;
   const legacyCodexStatusPath = `${config.contextDir}/codex-status.md`;
   const diffPath = `${config.contextDir}/implementation-diff.patch`;
@@ -895,17 +901,26 @@ async function writeAgentHandoff(
 
   let content = body;
   if (options.append) {
-    const raw = await readRawTextFileBounded(config, guard, workspace, planPath);
+    const raw = await readRawTextFileBounded(config, guard, control.repository, planPath);
     content = `${raw.trimEnd()}\n\n---\n\n${body}`;
   }
 
-  const writeResult = await writeTextFile(config, guard, workspace, planPath, content, { createDirs: true, overwrite: true });
+  if (control.metadata !== null) {
+    const metadataPath = `${config.contextDir}/worktrees/${control.planRef}/target.json`;
+    await writeTextFile(config, guard, control.repository, metadataPath,
+      `${JSON.stringify(control.metadata, null, 2)}\n`, { createDirs: true, overwrite: true });
+  }
+  const writeResult = await writeTextFile(config, guard, control.repository, planPath, content,
+    { createDirs: true, overwrite: true });
   const event = {
     agent,
     agent_name: agentName,
     model,
     title: options.title,
-    plan_path: planPath,
+    plan_path: displayPlanPath,
+    control_root: control.repository.root,
+    target_root: workspace.root,
+    plan_ref: control.planRef,
     status_path: statusPath,
     diff_path: diffPath
   };
@@ -915,10 +930,10 @@ async function writeAgentHandoff(
   await fsp.appendFile(executionLogResolved.absPath, jsonlEvent(options.eventName, event), "utf8");
 
   const promptLines = [
-    `Read ${planPath} and execute it in small, reviewable steps.`,
+    `Read ${displayPlanPath} and execute it in small, reviewable steps.`,
     `After each meaningful change, update ${statusPath} with files touched, checks run, results, blockers, and the next review focus.`,
     `Before review, write the final diff to ${diffPath} when practical.`,
-    agentCommandHint(agent, planPath, model)
+    agentCommandHint(agent, displayPlanPath, model)
   ];
   if (agent === "codex") {
     promptLines.splice(2, 0, `For legacy Codex handoffs, mirror key status notes to ${legacyCodexStatusPath} if your workflow expects that file.`);
@@ -930,13 +945,16 @@ async function writeAgentHandoff(
     agentName,
     model,
     title: options.title,
-    planPath,
+    planPath: displayPlanPath,
     statusPath,
     diffPath,
     logPath,
     executionLogPath,
     prompt,
-    writeResult
+    writeResult,
+    controlRoot: control.repository.root,
+    targetRoot: workspace.root,
+    planRef: control.planRef
   };
 }
 
@@ -3053,6 +3071,9 @@ ${result.prompt}
         agent_name: result.agentName,
         model: result.model,
         plan_path: result.planPath,
+        control_root: result.controlRoot,
+        target_root: result.targetRoot,
+        plan_ref: result.planRef,
         status_path: result.statusPath,
         diff_path: result.diffPath,
         log_path: result.logPath,
@@ -3111,6 +3132,9 @@ ${result.prompt}
         agent: result.agent,
         agent_name: result.agentName,
         plan_path: result.planPath,
+        control_root: result.controlRoot,
+        target_root: result.targetRoot,
+        plan_ref: result.planRef,
         status_path: result.statusPath,
         diff_path: result.diffPath,
         log_path: result.logPath,
