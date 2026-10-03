@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mark replacing handoff writes and Pro context exports as destructive in MCP tool annotations; keep the restored self-test probe non-destructive.
+
 ## 0.30.2 (2026-09-20)
 
 - Read the runtime and MCP server version from package metadata so release entrypoints cannot drift from `package.json`.
