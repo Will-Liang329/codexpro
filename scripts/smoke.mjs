@@ -247,6 +247,12 @@ for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_invento
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+for (const name of ['handoff_to_agent', 'handoff_to_codex']) {
+  const annotations = toolsByName.get(name)?.annotations ?? {};
+  if (annotations.readOnlyHint !== false || annotations.openWorldHint !== false || annotations.destructiveHint !== true || annotations.idempotentHint !== false) {
+    throw new Error(`${name} exposed unexpected replacing handoff annotations: ${JSON.stringify(annotations)}`);
+  }
+}
 if (toolsByName.get('handoff_to_agent')?.inputSchema?.properties?.reasoning_effort?.type !== 'string') {
   throw new Error('handoff_to_agent schema did not expose reasoning_effort as a string');
 }
