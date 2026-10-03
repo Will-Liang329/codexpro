@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Updated transitive brace-expansion and ip-address dependencies to patched releases; full and production-only dependency audits report zero known vulnerabilities.
 - Mark replacing handoff writes and Pro context exports as destructive in MCP tool annotations; keep the restored self-test probe non-destructive.
 
 ## 0.30.2 (2026-09-20)
