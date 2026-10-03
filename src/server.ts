@@ -3083,7 +3083,7 @@ export function createCodexProServer(
         plan: z.string().describe("Detailed implementation plan for the local agent."),
         append: z.boolean().optional().describe("Append to existing current-plan.md instead of overwriting. Default: false.")
       },
-      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      annotations: { ...HANDOFF_WRITE_ANNOTATIONS, destructiveHint: true },
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Writing agent handoff plan...",
@@ -3152,7 +3152,7 @@ ${result.prompt}
         plan: z.string().describe("Detailed implementation plan for Codex."),
         append: z.boolean().optional().describe("Append to existing current-plan.md instead of overwriting. Default: false.")
       },
-      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      annotations: { ...HANDOFF_WRITE_ANNOTATIONS, destructiveHint: true },
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Writing Codex handoff plan...",
