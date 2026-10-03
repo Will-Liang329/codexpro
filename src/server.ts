@@ -1013,7 +1013,8 @@ const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destru
 const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
-const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
+// The self-test restores or removes its temporary write/edit probe afterward.
+const LOCAL_PROBE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
 export function createCodexProServer(
   config: CodexProConfig,
@@ -1191,7 +1192,7 @@ export function createCodexProServer(
         include_global_skills: z.boolean().optional().describe("Include user/plugin skill discovery in the inventory check. Default: true."),
         max_skills: z.number().int().min(1).max(120).optional().describe("Maximum skills to inspect during the inventory check. Default: 40.")
       },
-      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      annotations: LOCAL_PROBE_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Running CodexPro self-test...",
@@ -2831,7 +2832,7 @@ export function createCodexProServer(
         max_file_bytes: z.number().int().min(1000).max(250000).optional().describe("Maximum bytes per included file. Default: 60000."),
         max_total_bytes: z.number().int().min(20000).max(2000000).optional().describe("Maximum bytes in the generated bundle.")
       },
-      annotations: HANDOFF_WRITE_ANNOTATIONS,
+      annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Exporting Pro context...",
@@ -3083,7 +3084,7 @@ export function createCodexProServer(
         plan: z.string().describe("Detailed implementation plan for the local agent."),
         append: z.boolean().optional().describe("Append to existing current-plan.md instead of overwriting. Default: false.")
       },
-      annotations: { ...HANDOFF_WRITE_ANNOTATIONS, destructiveHint: true },
+      annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Writing agent handoff plan...",
@@ -3152,7 +3153,7 @@ ${result.prompt}
         plan: z.string().describe("Detailed implementation plan for Codex."),
         append: z.boolean().optional().describe("Append to existing current-plan.md instead of overwriting. Default: false.")
       },
-      annotations: { ...HANDOFF_WRITE_ANNOTATIONS, destructiveHint: true },
+      annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Writing Codex handoff plan...",
