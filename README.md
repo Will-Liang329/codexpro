@@ -205,3 +205,7 @@ npm run release:publish
 - [Stable URL guide](DOMAIN_SETUP.md)
 - [Changelog](CHANGELOG.md)
 - [Contributors](CONTRIBUTORS.md)
+
+## Execution backends
+
+CodexPro supports an explicit Orca backend for new handoffs and retains AHR as the initial default and migration fallback. See [selection, prerequisites, smoke verification, and rollback](docs/execution-backends.md). Orca becomes preferred after both full-chain smokes pass.

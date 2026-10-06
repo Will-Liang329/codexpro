@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { executionBackend, type ExecutionBackend } from "./executionBackend.js";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
@@ -13,6 +14,9 @@ export const MIN_HTTP_TOKEN_BYTES = 24;
 export const MAX_BASH_TIMEOUT_MS = 900_000;
 
 export interface CodexProConfig {
+  executionBackend: ExecutionBackend;
+  orcaExecutable: string;
+  orcaTimeoutMs: number;
   defaultRoot: string;
   allowedRoots: string[];
   host: string;
@@ -330,6 +334,9 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     host,
     port: numberFrom(portArg ?? process.env.CODEXPRO_PORT ?? process.env.PORT, 8787, 1, 65535),
     widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.CODEXPRO_WIDGET_DOMAIN),
+    executionBackend: executionBackend(process.env.CODEXPRO_EXECUTION_BACKEND),
+    orcaExecutable: process.env.CODEXPRO_ORCA_BINARY || "orca",
+    orcaTimeoutMs: numberFrom(process.env.CODEXPRO_ORCA_TIMEOUT_MS, 60000, 1000, 120000),
     authToken,
     requireHttpToken,
     bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),

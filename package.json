@@ -70,7 +70,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "npm run build && npm run smoke",
+    "check": "npm run build && npm run smoke && node --test test/execution-backend.test.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "node scripts/release-guard.mjs",
     "start": "node dist/stdio.js",
@@ -97,7 +97,9 @@
     "release:pack": "node scripts/release-pack.mjs",
     "package:smoke": "node scripts/package-install-smoke.mjs",
     "release:check": "npm run release:guard && npm run build && npm run smoke && npm run stress && npm audit --audit-level=high && npm run release:pack && npm run package:smoke",
-    "release:publish": "node scripts/release-publish.mjs"
+    "release:publish": "node scripts/release-publish.mjs",
+    "test:execution-backends": "npm run build && node --test test/execution-backend.test.mjs",
+    "smoke:orca": "npm run build && node scripts/orca-integration-smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",
