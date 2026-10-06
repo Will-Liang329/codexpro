@@ -22,6 +22,21 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { resolveHandoffControl } from "./handoffControl.js";
+import { launchOrca, OrcaLaunchError } from "./executionBackend.js";
+
+async function orcaHandoffResult(config: CodexProConfig, workspace: Workspace, args: {
+  plan: string; agent?: string; model?: string; reasoning_effort?: string; title?: string; append?: boolean;
+}): Promise<any> {
+  try {
+    const receipt = await launchOrca(config, { workspace: workspace.root, plan: args.plan,
+      agent: args.agent, model: args.model, reasoningEffort: args.reasoning_effort,
+      title: args.title, append: args.append });
+    return textResult(`Orca worker ${receipt.state}. Run: ${receipt.runId}; Task: ${receipt.taskId}; Dispatch: ${receipt.dispatchId}`, receipt);
+  } catch (error) {
+    if (!(error instanceof OrcaLaunchError)) throw error;
+    return { ...textResult(error.message, error.receipt), isError: true };
+  }
+}
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -1150,6 +1165,9 @@ export function createCodexProServer(
         codexSessions: config.codexSessions,
         codexDir: config.codexDir,
         writeMode: config.writeMode,
+        executionBackend: config.executionBackend,
+        orcaExecutable: config.orcaExecutable,
+        orcaTimeoutMs: config.orcaTimeoutMs,
         toolMode: config.toolMode,
         exposeAbsolutePaths: config.exposeAbsolutePaths,
         toolCards: config.toolCards,
@@ -3073,7 +3091,7 @@ export function createCodexProServer(
     {
       title: "Handoff To Agent",
       description:
-        "Write .ai-bridge/current-plan.md for Codex, OpenCode, Pi, or another local implementation agent. This only creates handoff files; it does not execute local agent commands.",
+        "Hand off the plan using the configured execution backend. AHR writes handoff files; Orca starts a supervised worker and returns its launch receipt.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         agent: z.string().optional().describe("Target agent id, for example codex, opencode, pi, or custom. Default: custom."),
@@ -3093,6 +3111,7 @@ export function createCodexProServer(
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (config.executionBackend === "orca") return orcaHandoffResult(config, workspace, args);
       const result = await writeAgentHandoff(config, guard, workspace, {
         agent: args.agent,
         agentName: args.agent_name,
@@ -3162,6 +3181,7 @@ ${result.prompt}
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (config.executionBackend === "orca") return orcaHandoffResult(config, workspace, { ...args, agent: "codex" });
       const result = await writeAgentHandoff(config, guard, workspace, {
         agent: "codex",
         title: cleanOneLine(args.title, "Codex implementation plan"),
