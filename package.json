@@ -102,7 +102,7 @@
     "smoke:orca": "npm run build && node scripts/orca-integration-smoke.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "chardet": "^2.2.0",
     "express": "^5.1.0",
     "iconv-lite": "^0.7.3",
