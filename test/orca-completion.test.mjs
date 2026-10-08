@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launchOrca, waitForOrca } from '../dist/executionBackend.js';
@@ -9,6 +10,18 @@ const workspace = await fs.realpath(os.tmpdir());
 const config = { orcaExecutable: 'configured-orca', orcaTimeoutMs: 1000 };
 const id = { runId: 'run-1', taskId: 'task-1', dispatchId: 'ctx-1', coordinatorHandle: 'term-coord' };
 const opts = { maxWaitMs: 5000, pollMs: 1000, workspace };
+// Real report artifacts for filesystem-aware reportPath confinement.
+const fixtureDir = await fs.mkdtemp(path.join(workspace, 'orca-report-'));
+const fixtureRel = path.relative(workspace, fixtureDir);
+await fs.writeFile(path.join(fixtureDir, 'r.md'), 'report');
+const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-outside-'));
+await fs.writeFile(path.join(outsideDir, 'report.md'), 'secret');
+await fs.mkdir(path.join(fixtureDir, 'ws'));
+await fs.writeFile(path.join(fixtureDir, 'ws', 'r.md'), 'report');
+await fs.symlink(outsideDir, path.join(fixtureDir, 'ws', 'escape'));
+await fs.symlink(path.join(fixtureDir, 'missing-target'), path.join(fixtureDir, 'ws', 'broken'));
+await fs.symlink(path.join(fixtureDir, 'ws', 'r.md'), path.join(fixtureDir, 'ws', 'inside-link.md'));
+process.on('exit', () => { try { fsSync.rmSync(fixtureDir, { recursive: true, force: true }); fsSync.rmSync(outsideDir, { recursive: true, force: true }); } catch {} });
 const ok = (result, exitCode = 0) => ({ exitCode, stdout: JSON.stringify({ ok: true, result }), stderr: 'SECRET_PROVIDER_STDERR sk-abcdefghijklmnopqrstuvwxyz123456' });
 const fail = (code, message) => ({ exitCode: 1, stdout: JSON.stringify({ ok: false, error: { code, message } }), stderr: 'noise' });
 const done = (over = {}, msg = {}) => ({ id: 'msg-done', run_id: 'run-1', type: 'worker_done', from_handle: 'term-worker', subject: 'Done',
@@ -46,6 +59,7 @@ function mock({ batches = [], show = shown(), list = tasks(), ackFail = false, o
 }
 const delivery = (deliveryId, messages) => ({ runId: 'run-1', deliveryId, messages, count: messages.length, acknowledged: null });
 const checks = (m) => m.calls.filter(c => c.args[1] === 'check');
+const ackOf = (m) => { const c = checks(m).filter((x) => x.args.includes('--ack')).at(-1).args; return c[c.indexOf('--ack') + 1]; };
 const run = (m, o = opts) => waitForOrca(config, id, o, m.process);
 const verbs = (m) => m.calls.map(c => c.args[1]);
 
@@ -79,13 +93,13 @@ test('timeout with no message is running, never completed', async () => {
 });
 
 test('matching successful worker_done completes with optional fields and exact ids', async () => {
-  const m = mock({ batches: [delivery('d1', [done({ filesModified: ['a.ts', 'b.ts'], reportPath: '.ai-bridge/r.md' })])] });
+  const m = mock({ batches: [delivery('d1', [done({ filesModified: ['a.ts', 'b.ts'], reportPath: path.join(fixtureRel, 'r.md') })])] });
   const r = await run(m);
   assert.deepEqual([r.backend, r.state, r.awaited_terminal, r.awaited_completed, r.succeeded, r.outcome], ['orca', 'completed', true, true, true, 'succeeded']);
   assert.deepEqual([r.runId, r.taskId, r.dispatchId], ['run-1', 'task-1', 'ctx-1']);
   assert.equal(r.summary, 'Implemented it.');
   assert.deepEqual(r.filesModified, ['a.ts', 'b.ts']);
-  assert.equal(r.reportPath, '.ai-bridge/r.md');
+  assert.equal(r.reportPath, path.join(fixtureRel, 'r.md'));
   assert.equal(r.worker_done.message_id, 'msg-done'); assert.equal(r.worker_done.delivery_id, 'd1');
   assert.equal(r.cross_check.status, 'consistent'); assert.equal(r.evidence_conflict, undefined);
   assert.deepEqual(r.effective, { agent: 'codex', model: 'm', effort: 'high' });
@@ -99,8 +113,8 @@ test('optional fields are absent safely; unsafe reportPath is dropped', async ()
     r = await run(mock({ batches: [delivery('d1', [done({ reportPath: bad })])] }));
     assert.ok(!('reportPath' in r)); assert.equal(r.reportPath_rejected, true);
   }
-  r = await run(mock({ batches: [delivery('d1', [done({ reportPath: path.join(workspace, 'r.md') })])] }));
-  assert.equal(r.reportPath, path.join(workspace, 'r.md'));
+  r = await run(mock({ batches: [delivery('d1', [done({ reportPath: path.join(fixtureDir, 'r.md') })])] }));
+  assert.equal(r.reportPath, path.join(fixtureDir, 'r.md'));
 });
 
 test('matching failed worker_done is terminal and not succeeded', async () => {
@@ -152,12 +166,12 @@ test('failed ack is reported but never changes the authoritative result', async 
 });
 
 test('question/escalation surface as blocked and are acked, not completion', async () => {
-  const q = { id: 'msg-q', run_id: 'run-1', type: 'question', subject: 'Which?', body: 'A or B? token=abc123abc123abc123abc123', payload: '{}' };
+  const q = { id: 'msg-q', run_id: 'run-1', type: 'question', subject: 'Which?', body: 'A or B? token=abc123abc123abc123abc123', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'ctx-1' }) };
   const m = mock({ batches: [delivery('dq', [q])], show: shown('in_progress'), list: tasks('dispatched') });
   const r = await run(m);
   assert.equal(r.state, 'blocked'); assert.equal(r.awaited_terminal, false);
   assert.equal(r.pending_messages[0].id, 'msg-q');
-  assert.equal(checks(m).at(-1).args[checks(m).at(-1).args.indexOf('--ack') + 1], 'dq');
+  assert.equal(ackOf(m), 'dq');
 });
 
 test('malformed, error and unreachable Orca responses fail safely without acking', async () => {
@@ -240,7 +254,7 @@ import fs from 'node:fs';
 const a = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(log)}, a.slice(0,2).join(' ') + '\\n');
 const out = (r) => process.stdout.write(JSON.stringify({ ok: true, result: r }));
 process.stderr.write('SECRET_PROVIDER_STDERR');
-if (a[1] === 'check') out(a.includes('--peek') ? { runId: 'run-1', messages: [], count: 0 } : { runId: 'run-1', deliveryId: 'd1', count: 1, messages: [{ id: 'm1', run_id: 'run-1', type: 'worker_done', from_handle: 'w', body: 'ok', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'ctx-1', outcome: 'succeeded' }) }] });
+if (a[1] === 'check') out(a.includes('--peek') ? { runId: 'run-1', messages: [], count: 0, acknowledged: a[a.indexOf('--ack') + 1] } : { runId: 'run-1', deliveryId: 'd1', count: 1, messages: [{ id: 'm1', run_id: 'run-1', type: 'worker_done', from_handle: 'w', body: 'ok', payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'ctx-1', outcome: 'succeeded' }) }] });
 else if (a[1] === 'worker-show') out({ dispatch: { id: 'ctx-1', taskId: 'task-1', runId: 'run-1' }, worker: { agentTerminalHandle: 'w' }, projection: { outcome: 'succeeded' } });
 else out({ tasks: [{ id: 'task-1', run_id: 'run-1', status: 'completed' }] });
 `);
@@ -260,8 +274,114 @@ else out({ tasks: [{ id: 'task-1', run_id: 'run-1', status: 'completed' }] });
     assert.equal(done.structuredContent.succeeded, true);
     assert.ok(!JSON.stringify(done).includes('SECRET_PROVIDER_STDERR'));
     assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'), ['orchestration check', 'orchestration check', 'orchestration worker-show', 'orchestration task-list']);
+    assert.equal(done.structuredContent.ack.status, 'acknowledged');
+    const tool = (await client.listTools()).tools.find((t) => t.name === 'wait_for_handoff');
+    assert.equal(tool.annotations.readOnlyHint, false); assert.equal(tool.annotations.destructiveHint, false);
+    assert.equal(tool.annotations.openWorldHint, false); assert.equal(tool.annotations.idempotentHint, false);
+    assert.doesNotMatch(tool.description, /Read-only|never starts processes/);
     const ahr = await client.callTool({ name: 'wait_for_handoff', arguments: { max_wait_seconds: 1 } });
     assert.equal(ahr.structuredContent.backend, undefined); assert.equal(ahr.structuredContent.state, 'unknown');
     assert.match(ahr.structuredContent.state_file, /handoff-run-state\.json$/);
   } finally { await client.close().catch(() => {}); await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+const generic = (over = {}) => ({ id: 'msg-gq', run_id: 'run-1', type: 'question', from_handle: 'term-other', subject: 'Other?', body: 'unrelated', payload: '{}', ...over });
+
+test('P2-2: generic/stale question before the matching worker_done is drained and completion is reached', async () => {
+  for (const payload of ['{}', 'not json', JSON.stringify({ taskId: 'task-other', dispatchId: 'ctx-other' }), JSON.stringify({ taskId: 'task-1', dispatchId: 'ctx-other' })]) {
+    for (const type of ['question', 'escalation']) {
+      const m = mock({ batches: [delivery('d1', [generic({ type, payload })]), delivery('d2', [done()])] });
+      const r = await run(m);
+      assert.equal(r.state, 'completed', `${type} ${payload}`); assert.equal(r.worker_done.delivery_id, 'd2');
+      assert.equal(r.pending_messages, undefined);
+      const acks = checks(m).filter((c) => c.args.includes('--ack')).map((c) => c.args[c.args.indexOf('--ack') + 1]);
+      assert.deepEqual(acks, ['d1', 'd2']);
+    }
+  }
+});
+
+test('P2-2: attributable question/escalation (payload Task or Dispatch) stays blocked and exact-ACKed', async () => {
+  for (const payload of [{ taskId: 'task-1', dispatchId: 'ctx-1' }, { dispatchId: 'ctx-1' }, { taskId: 'task-1' }]) {
+    for (const type of ['question', 'escalation']) {
+      const m = mock({ batches: [delivery('dq', [generic({ type, payload: JSON.stringify(payload) }), ]), delivery('dz', [done()])], show: shown('in_progress'), list: tasks('dispatched') });
+      const r = await run(m);
+      assert.equal(r.state, 'blocked'); assert.equal(r.pending_messages[0].type, type); assert.equal(ackOf(m), 'dq');
+      assert.equal(checks(m).filter((c) => !c.args.includes('--all') && !c.args.includes('--peek')).length, 1);
+    }
+  }
+});
+
+test('P2-3: ACKed worker_done is recovered when worker-show is unavailable', async () => {
+  const m = mock({ history: [done()], show: fail('dispatch_not_found', 'gone') });
+  const r = await run(m);
+  assert.equal(r.state, 'completed'); assert.equal(r.worker_done.recovered_from_history, true);
+  assert.equal(r.cross_check.status, 'unavailable'); assert.ok(checks(m).some((c) => c.args.includes('--all')));
+  assert.ok(!checks(m).some((c) => c.args.includes('--ack')));
+});
+
+test('P2-3: ACKed worker_done is recovered while Task projection is non-terminal, or with task-list failing', async () => {
+  let r = await run(mock({ history: [done()], show: shown('in_progress'), list: tasks('dispatched') }));
+  assert.equal(r.state, 'completed'); assert.equal(r.worker_done.recovered_from_history, true);
+  assert.equal(r.cross_check.task_status, 'dispatched'); assert.ok(r.evidence_conflict.some((c) => /Task status is dispatched/.test(c)));
+  r = await run(mock({ history: [done()], list: fail('x', 'down') }));
+  assert.equal(r.state, 'completed');
+  r = await run(mock({ history: [done({ outcome: 'failed' })], show: fail('x', 'down'), list: tasks('dispatched') }));
+  assert.equal(r.state, 'failed'); assert.equal(r.succeeded, false);
+});
+
+test('P2-3: recovery needs exact Task/Dispatch/outcome even with an unrelated pending message', async () => {
+  const q = generic({ payload: JSON.stringify({ taskId: 'task-1', dispatchId: 'ctx-1' }) });
+  let r = await run(mock({ batches: [delivery('dq', [q])], history: [done()], show: shown('in_progress'), list: tasks('dispatched') }));
+  assert.equal(r.state, 'completed');
+  r = await run(mock({ history: [done({ dispatchId: 'zzz' }), done({ outcome: 'maybe' })], show: fail('x', 'down') }));
+  assert.notEqual(r.state, 'completed'); assert.equal(r.succeeded, false);
+});
+
+test('P2-4: reportPath is confined by real path (symlink escape, broken link, missing file rejected)', async () => {
+  const ws = path.join(fixtureDir, 'ws');
+  const narrow = { ...opts, workspace: ws };
+  for (const bad of ['escape/report.md', path.join(ws, 'escape', 'report.md'), 'broken', 'missing.md', path.join(outsideDir, 'report.md'), '.']) {
+    const r = await run(mock({ batches: [delivery('d1', [done({ reportPath: bad })])] }), narrow);
+    assert.equal(r.state, 'completed', bad); assert.ok(!('reportPath' in r), bad); assert.equal(r.reportPath_rejected, true, bad);
+  }
+  for (const good of ['inside-link.md', 'r.md', path.join(ws, 'r.md')]) {
+    const r = await run(mock({ batches: [delivery('d1', [done({ reportPath: good })])] }), narrow);
+    assert.equal(r.reportPath, good);
+  }
+  const none = await run(mock({ batches: [delivery('d1', [done({ reportPath: 'r.md' })])] }), { ...opts, workspace: undefined });
+  assert.equal(none.state, 'completed'); assert.equal(none.reportPath_rejected, true);
+});
+
+test('P2-5: malformed messages shape fails safely and is never ACKed', async () => {
+  for (const messages of [{ wrong: 'shape' }, 'x', null, undefined, [null], ['str']]) {
+    const m = mock({ batches: [ok({ runId: 'run-1', deliveryId: 'dbad', messages, count: 1 })] });
+    const r = await run(m);
+    assert.equal(r.state, 'unknown'); assert.equal(r.error.code, 'malformed_result'); assert.equal(r.succeeded, false);
+    assert.ok(!checks(m).some((c) => c.args.includes('--ack')), JSON.stringify(messages));
+    assert.ok(!r.ack);
+  }
+  const m = mock({ batches: [delivery('d1', [noise(1)]), ok({ runId: 'run-1', deliveryId: 'd2', messages: 'bad' })] });
+  const r = await run(m);
+  assert.equal(r.state, 'unknown'); assert.deepEqual(r.ack, { delivery_id: 'd1', status: 'acknowledged' });
+  assert.ok(!checks(m).some((c) => c.args.includes('--ack') && c.args.includes('d2')));
+});
+
+test('P2-5: invalid final ACK receipt is not reported acknowledged but keeps the worker_done verdict', async () => {
+  for (const receipt of [{ runId: 'other-run', messages: [], acknowledged: 'd1' }, { runId: 'run-1', messages: [], acknowledged: null },
+    { runId: 'run-1', messages: [], acknowledged: 'other-delivery' }, { runId: 'run-1', messages: [], count: 0 }]) {
+    const m = mock({ batches: [delivery('d1', [done()])], onCheck: undefined });
+    const base = m.process;
+    const r = await waitForOrca(config, id, opts, async (b, args, cwd, t) => (args.includes('--peek') ? ok(receipt) : base(b, args, cwd, t)));
+    assert.equal(r.state, 'completed'); assert.equal(r.succeeded, true);
+    assert.equal(r.ack.status, 'failed'); assert.equal(r.ack.delivery_id, 'd1'); assert.match(r.ack.error, /did not confirm/);
+    assert.ok(!JSON.stringify(r).includes('SECRET_PROVIDER_STDERR'));
+  }
+  const good = await run(mock({ batches: [delivery('d1', [done()])] }));
+  assert.equal(good.ack.status, 'acknowledged');
+});
+
+test('P2-5: mismatched ACK receipt on a follow-up check is not reported acknowledged', async () => {
+  const m = mock({ batches: [delivery('d1', [noise(1)]), ok({ runId: 'run-1', deliveryId: null, messages: [], count: 0, acknowledged: 'zzz', timedOut: true })] });
+  const r = await run(m);
+  assert.equal(r.ack.status, 'failed'); assert.equal(r.ack.delivery_id, 'd1');
 });

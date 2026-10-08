@@ -128,6 +128,7 @@ const WAIT_TYPES = ["worker_done", "question", "escalation"];
 const MAX_BATCHES = 50;
 const TEXT_MAX = 4000;
 const LIST_MAX = 100;
+const HISTORY_MAX = 2000;
 
 function clip(value: unknown, max = TEXT_MAX): string | undefined {
   if (typeof value !== "string" || !value) return undefined;
@@ -143,15 +144,18 @@ function parsePayload(value: unknown): Record<string, any> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
 }
 
-function safeReportPath(value: unknown, workspace?: string): string | undefined {
+// Filesystem-aware confinement: both paths are resolved through symlinks and the report must
+// exist inside the real workspace. Anything unprovable (missing, broken link, error) is dropped.
+// The file is never opened or read.
+async function safeReportPath(value: unknown, workspace?: string): Promise<string | undefined> {
   if (typeof value !== "string" || !value || value.length > 500 || /[\u0000-\u001f]/.test(value)) return undefined;
-  const parts = value.split(/[\\/]/);
-  if (parts.includes("..")) return undefined;
-  if (path.isAbsolute(value)) {
-    if (!workspace) return undefined;
-    const relative = path.relative(workspace, value);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
-  }
+  if (!workspace || value.split(/[\\/]/).includes("..")) return undefined;
+  try {
+    const realWorkspace = await fs.realpath(workspace);
+    const real = await fs.realpath(path.isAbsolute(value) ? value : path.join(realWorkspace, value));
+    const relative = path.relative(realWorkspace, real);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
+  } catch { return undefined; }
   return redactSensitiveText(value);
 }
 
@@ -181,9 +185,17 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     return object(json.result);
   };
   const quick = (args: string[]) => call(args, config.orcaTimeoutMs + 10000);
+  // Public check results must carry an array of object messages; anything else is malformed and never processed or ACKed.
+  const messageList = (result: Record<string, any>): any[] => {
+    if (!Array.isArray(result.messages) || result.messages.some((m: unknown) => m === null || typeof m !== "object" || Array.isArray(m))) {
+      throw new OrcaCallError("Orca check returned a malformed messages result", "malformed_result");
+    }
+    return result.messages;
+  };
 
   let ackPending: string | undefined;
   let lastAcked: string | undefined;
+  let ackProblem: string | undefined;
   const conflicts: string[] = [];
   const pending: Record<string, unknown>[] = [];
   let ignored = 0;
@@ -206,7 +218,10 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
         conflicts.push(`worker_done ${clip(message.id, 80) ?? ""} matches only the ${taskOk ? "Task" : "Dispatch"}; ignored`);
       } else ignored++;
     } else if (message.type === "question" || message.type === "escalation") {
-      if ((payload?.dispatchId !== undefined && payload.dispatchId !== dispatchId) || (payload?.taskId !== undefined && payload.taskId !== taskId)) { ignored++; return; }
+      // Only a message provably attributed to the awaited Task/Dispatch may block; generic or foreign ones are drained.
+      const dispatchOk = payload?.dispatchId === dispatchId, taskOk = payload?.taskId === taskId;
+      const contradicts = (payload?.dispatchId !== undefined && !dispatchOk) || (payload?.taskId !== undefined && !taskOk);
+      if (!(dispatchOk || taskOk) || contradicts) { ignored++; return; }
       const entry = { id: clip(message.id, 80), type: message.type, subject: clip(message.subject, 300), body: clip(message.body, 2000) };
       pending.push(entry); blocked ??= entry;
     } else ignored++;
@@ -216,7 +231,8 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     const code = error instanceof OrcaCallError ? error.code : "orca_unavailable";
     return { ...base, state: "unknown", awaited_terminal: false, awaited_completed: false, succeeded: false,
       error: { code, message: clip(error instanceof Error ? error.message : "Orca check failed", 500) },
-      ...(ackPending ? { ack: { delivery_id: ackPending, status: "not_sent" } } : {}),
+      ...(ackPending ? { ack: { delivery_id: ackPending, status: "not_sent" } }
+        : lastAcked ? { ack: ackProblem ? { delivery_id: lastAcked, status: "failed", error: ackProblem } : { delivery_id: lastAcked, status: "acknowledged" } } : {}),
       next_poll_after_seconds: nextPoll };
   };
 
@@ -228,9 +244,17 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       if (remaining > 0) args.push("--wait", "--timeout-ms", String(remaining));
       const sentAck = ackPending;
       const result = await call(args, remaining + config.orcaTimeoutMs + 10000);
-      if (sentAck) { lastAcked = sentAck; ackPending = undefined; }
       if (result.runId !== runId) throw new OrcaCallError("Orca check returned a different Run than the launch receipt", "run_mismatch");
-      const messages = Array.isArray(result.messages) ? result.messages : [];
+      if (sentAck) {
+        lastAcked = sentAck; ackPending = undefined;
+        if (typeof result.acknowledged === "string" && result.acknowledged !== sentAck) {
+          ackProblem = "Orca ACK receipt named a different delivery than the one acknowledged";
+        }
+      }
+      const messages = messageList(result);
+      if (result.deliveryId !== undefined && result.deliveryId !== null && (typeof result.deliveryId !== "string" || !result.deliveryId)) {
+        throw new OrcaCallError("Orca check returned a malformed delivery id", "malformed_result");
+      }
       const deliveryId = typeof result.deliveryId === "string" && result.deliveryId ? result.deliveryId : undefined;
       if (messages.length === 0) {
         if (result.timedOut === true || result.cancelled === true || remaining === 0 || !deliveryId) break;
@@ -247,12 +271,16 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   let ack: Record<string, unknown> | undefined;
   if (ackPending) {
     try {
-      await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--ack", ackPending, "--peek"]);
-      ack = { delivery_id: ackPending, status: "acknowledged" };
+      const receipt = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--ack", ackPending, "--peek"]);
+      if (receipt.runId !== runId || receipt.acknowledged !== ackPending) {
+        ack = { delivery_id: ackPending, status: "failed", error: "Orca ACK receipt did not confirm the exact delivery for this Run" };
+      } else ack = { delivery_id: ackPending, status: "acknowledged" };
     } catch (error) {
       ack = { delivery_id: ackPending, status: "failed", error: clip(error instanceof Error ? error.message : "ack failed", 300) };
     }
-  } else if (lastAcked) ack = { delivery_id: lastAcked, status: "acknowledged" };
+  } else if (lastAcked) {
+    ack = ackProblem ? { delivery_id: lastAcked, status: "failed", error: ackProblem } : { delivery_id: lastAcked, status: "acknowledged" };
+  }
 
   // Read-only cross-check against the public Task / Dispatch surface.
   let worker: Record<string, unknown> | undefined;
@@ -286,11 +314,12 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
 
   // A prior poll may already have consumed and acked the worker_done. `check --all` is a
   // documented read-only history view (no read marking, no ack), so recover the exact message.
-  if (!matched && !blocked && (taskStatus === "completed" || taskStatus === "failed")) {
+  // Task/Dispatch/pending state above is evidence only and never gates this recovery.
+  if (!matched) {
     try {
       const history = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--all"]);
       if (history.runId === runId) {
-        for (const raw of Array.isArray(history.messages) ? history.messages : []) {
+        for (const raw of messageList(history).slice(0, HISTORY_MAX)) {
           if (object(raw).type === "worker_done") consider(raw, undefined);
         }
         if (matched) matched = { ...(matched as object), recovered: true } as typeof matched;
@@ -316,7 +345,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     const crossStatus = crossError ? "unavailable" : taskStatus === undefined ? "unavailable" : conflicts.length ? "mismatch" : "consistent";
     const files = Array.isArray(matched.payload.filesModified)
       ? matched.payload.filesModified.filter((f: unknown) => typeof f === "string").slice(0, LIST_MAX).map((f: string) => clip(f, 500)).filter(Boolean) : undefined;
-    const reportPath = safeReportPath(matched.payload.reportPath, options.workspace);
+    const reportPath = await safeReportPath(matched.payload.reportPath, options.workspace);
     return { ...common, state: outcome === "succeeded" ? "completed" : "failed", awaited_terminal: true,
       awaited_completed: outcome === "succeeded", succeeded: outcome === "succeeded", outcome,
       worker_done: { message_id: clip(matched.message.id, 80), ...(matched.deliveryId ? { delivery_id: matched.deliveryId } : {}), ...(matched.recovered ? { recovered_from_history: true } : {}), created_at: clip(matched.message.created_at, 40) },
