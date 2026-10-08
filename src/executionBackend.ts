@@ -278,6 +278,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
 
   // Mailbox ACK for the final processed batch (Orca consumer protocol); never before processing.
   let ack: Record<string, unknown> | undefined;
+  let ackFence: { code: string; message: string | undefined } | undefined;
   if (ackPending) {
     try {
       const receipt = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--ack", ackPending, "--peek"]);
@@ -286,10 +287,19 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
         ackFailures.push({ delivery_id: ackPending, error: "Orca ACK receipt did not confirm the exact delivery for this Run" });
       } else ack = { delivery_id: ackPending, status: "acknowledged" };
     } catch (error) {
-      ack = { delivery_id: ackPending, status: "failed", error: clip(error instanceof Error ? error.message : "ack failed", 300) };
+      const message = clip(error instanceof Error ? error.message : "ack failed", 300);
+      const code = error instanceof OrcaCallError ? error.code : undefined;
+      ack = { delivery_id: ackPending, status: "failed", error: message, ...(code ? { code } : {}) };
+      // An ownership fence is fatal unless a validated worker_done already holds the verdict.
+      if (code === "consumer_fenced") ackFence = { code, message };
     }
   } else if (lastAcked) {
     ack = lastAckState(lastAcked);
+  }
+  if (ackFence && !matched) {
+    return { ...base, state: "unknown", awaited_terminal: false, awaited_completed: false, succeeded: false, error: ackFence,
+      ack, ...(ackFailures.length ? { ack_failures: ackFailures } : {}), ...(ignored ? { ignored_messages: ignored } : {}),
+      ...(pending.length ? { pending_messages: pending.slice(0, 10) } : {}), next_poll_after_seconds: nextPoll };
   }
 
   // Read-only cross-check against the public Task / Dispatch surface.
@@ -336,7 +346,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       if (matched) matched = { ...(matched as object), recovered: true } as typeof matched;
     } catch (error) {
       // Unavailable history is best-effort; a response violating the required schema is explicit unknown evidence.
-      if (error instanceof OrcaCallError && ["run_mismatch", "malformed_result", "malformed_json"].includes(error.code)) {
+      if (error instanceof OrcaCallError && ["run_mismatch", "malformed_result", "malformed_json", "consumer_fenced"].includes(error.code)) {
         historyError = { code: error.code, message: clip(error.message, 300) };
       }
     }
