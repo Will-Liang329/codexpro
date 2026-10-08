@@ -185,9 +185,12 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     return object(json.result);
   };
   const quick = (args: string[]) => call(args, config.orcaTimeoutMs + 10000);
-  // Public check results must carry an array of object messages; anything else is malformed and never processed or ACKed.
+  // Public check results must carry an array of object messages with at least a non-empty string id and type
+  // (needed to identify and classify them); anything else is malformed and never processed or ACKed.
+  const validRow = (m: any): boolean => m !== null && typeof m === "object" && !Array.isArray(m)
+    && typeof m.id === "string" && m.id !== "" && typeof m.type === "string" && m.type !== "";
   const messageList = (result: Record<string, any>): any[] => {
-    if (!Array.isArray(result.messages) || result.messages.some((m: unknown) => m === null || typeof m !== "object" || Array.isArray(m))) {
+    if (!Array.isArray(result.messages) || !result.messages.every(validRow)) {
       throw new OrcaCallError("Orca check returned a malformed messages result", "malformed_result");
     }
     return result.messages;
@@ -195,7 +198,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
 
   let ackPending: string | undefined;
   let lastAcked: string | undefined;
-  let ackProblem: string | undefined;
+  const ackFailures: { delivery_id: string; error: string }[] = [];
   const conflicts: string[] = [];
   const pending: Record<string, unknown>[] = [];
   let ignored = 0;
@@ -227,12 +230,18 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     } else ignored++;
   };
 
+  const lastAckState = (id: string): Record<string, unknown> => {
+    const failed = ackFailures.find((f) => f.delivery_id === id);
+    return failed ? { delivery_id: id, status: "failed", error: failed.error } : { delivery_id: id, status: "acknowledged" };
+  };
+
   const failure = (error: unknown) => {
     const code = error instanceof OrcaCallError ? error.code : "orca_unavailable";
     return { ...base, state: "unknown", awaited_terminal: false, awaited_completed: false, succeeded: false,
       error: { code, message: clip(error instanceof Error ? error.message : "Orca check failed", 500) },
       ...(ackPending ? { ack: { delivery_id: ackPending, status: "not_sent" } }
-        : lastAcked ? { ack: ackProblem ? { delivery_id: lastAcked, status: "failed", error: ackProblem } : { delivery_id: lastAcked, status: "acknowledged" } } : {}),
+        : lastAcked ? { ack: lastAckState(lastAcked) } : {}),
+      ...(ackFailures.length ? { ack_failures: ackFailures } : {}),
       next_poll_after_seconds: nextPoll };
   };
 
@@ -247,8 +256,8 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       if (result.runId !== runId) throw new OrcaCallError("Orca check returned a different Run than the launch receipt", "run_mismatch");
       if (sentAck) {
         lastAcked = sentAck; ackPending = undefined;
-        if (typeof result.acknowledged === "string" && result.acknowledged !== sentAck) {
-          ackProblem = "Orca ACK receipt named a different delivery than the one acknowledged";
+        if (result.acknowledged !== sentAck) {
+          ackFailures.push({ delivery_id: sentAck, error: "Orca ACK receipt did not confirm the exact delivery for this Run" });
         }
       }
       const messages = messageList(result);
@@ -274,12 +283,13 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       const receipt = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--ack", ackPending, "--peek"]);
       if (receipt.runId !== runId || receipt.acknowledged !== ackPending) {
         ack = { delivery_id: ackPending, status: "failed", error: "Orca ACK receipt did not confirm the exact delivery for this Run" };
+        ackFailures.push({ delivery_id: ackPending, error: "Orca ACK receipt did not confirm the exact delivery for this Run" });
       } else ack = { delivery_id: ackPending, status: "acknowledged" };
     } catch (error) {
       ack = { delivery_id: ackPending, status: "failed", error: clip(error instanceof Error ? error.message : "ack failed", 300) };
     }
   } else if (lastAcked) {
-    ack = ackProblem ? { delivery_id: lastAcked, status: "failed", error: ackProblem } : { delivery_id: lastAcked, status: "acknowledged" };
+    ack = lastAckState(lastAcked);
   }
 
   // Read-only cross-check against the public Task / Dispatch surface.
@@ -315,16 +325,21 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   // A prior poll may already have consumed and acked the worker_done. `check --all` is a
   // documented read-only history view (no read marking, no ack), so recover the exact message.
   // Task/Dispatch/pending state above is evidence only and never gates this recovery.
+  let historyError: { code: string; message: string | undefined } | undefined;
   if (!matched) {
     try {
       const history = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--all"]);
-      if (history.runId === runId) {
-        for (const raw of messageList(history).slice(0, HISTORY_MAX)) {
-          if (object(raw).type === "worker_done") consider(raw, undefined);
-        }
-        if (matched) matched = { ...(matched as object), recovered: true } as typeof matched;
+      if (history.runId !== runId) throw new OrcaCallError("Orca history returned a different Run than the launch receipt", "run_mismatch");
+      for (const raw of messageList(history).slice(0, HISTORY_MAX)) {
+        if (object(raw).type === "worker_done") consider(raw, undefined);
       }
-    } catch { /* history is best-effort; absence keeps the non-authoritative unknown state */ }
+      if (matched) matched = { ...(matched as object), recovered: true } as typeof matched;
+    } catch (error) {
+      // Unavailable history is best-effort; a response violating the required schema is explicit unknown evidence.
+      if (error instanceof OrcaCallError && ["run_mismatch", "malformed_result", "malformed_json"].includes(error.code)) {
+        historyError = { code: error.code, message: clip(error.message, 300) };
+      }
+    }
   }
 
   const requested = object(launch.requested), effective = object(launch.effective);
@@ -332,7 +347,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     ...(requested.agent !== undefined ? { requested: { agent: clip(requested.agent, 80), model: clip(requested.model, 120), effort: clip(requested.effort, 40) } } : {}),
     ...(effective.agent !== undefined ? { effective: { agent: clip(effective.agent, 80), model: clip(effective.model, 120), effort: clip(effective.effort, 40) } } : {}),
   };
-  const common = { ...base, ...launchInfo, ...(worker ? { worker } : {}), ...(ack ? { ack } : {}), ...(ignored ? { ignored_messages: ignored } : {}) };
+  const common = { ...base, ...launchInfo, ...(worker ? { worker } : {}), ...(ack ? { ack } : {}), ...(ackFailures.length ? { ack_failures: ackFailures } : {}), ...(ignored ? { ignored_messages: ignored } : {}) };
 
   if (matched) {
     const outcome = matched.payload.outcome as "succeeded" | "failed";
@@ -358,10 +373,11 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
 
   const settled = taskStatus === "completed" || taskStatus === "failed";
   if (settled) conflicts.push(`Orca Task is ${taskStatus} but no matching worker_done was observed (it may have been consumed earlier); outcome is not authoritative`);
-  const state = settled || conflicts.length ? "unknown" : blocked || waiting || attention ? "blocked" : "running";
+  const state = settled || conflicts.length || historyError ? "unknown" : blocked || waiting || attention ? "blocked" : "running";
   return { ...common, state, awaited_terminal: false, awaited_completed: false, succeeded: false,
     cross_check: { status: crossError ? "unavailable" : "pending", ...(taskStatus ? { task_status: taskStatus } : {}), ...(crossError ? { error: crossError } : {}) },
     ...(pending.length ? { pending_messages: pending.slice(0, 10) } : {}),
+    ...(historyError ? { error: historyError, history_check: "failed" } : {}),
     ...(conflicts.length ? { evidence_conflict: [...new Set(conflicts)] } : {}),
     next_poll_after_seconds: nextPoll };
 }

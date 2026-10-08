@@ -360,7 +360,7 @@ test('P2-5: malformed messages shape fails safely and is never ACKed', async () 
     assert.ok(!checks(m).some((c) => c.args.includes('--ack')), JSON.stringify(messages));
     assert.ok(!r.ack);
   }
-  const m = mock({ batches: [delivery('d1', [noise(1)]), ok({ runId: 'run-1', deliveryId: 'd2', messages: 'bad' })] });
+  const m = mock({ batches: [delivery('d1', [noise(1)]), ok({ runId: 'run-1', deliveryId: 'd2', messages: 'bad', acknowledged: 'd1' })] });
   const r = await run(m);
   assert.equal(r.state, 'unknown'); assert.deepEqual(r.ack, { delivery_id: 'd1', status: 'acknowledged' });
   assert.ok(!checks(m).some((c) => c.args.includes('--ack') && c.args.includes('d2')));
@@ -384,4 +384,61 @@ test('P2-5: mismatched ACK receipt on a follow-up check is not reported acknowle
   const m = mock({ batches: [delivery('d1', [noise(1)]), ok({ runId: 'run-1', deliveryId: null, messages: [], count: 0, acknowledged: 'zzz', timedOut: true })] });
   const r = await run(m);
   assert.equal(r.ack.status, 'failed'); assert.equal(r.ack.delivery_id, 'd1');
+});
+
+// ---- RF2 P2-5 remainder ----
+const acked = (extra = {}) => (args) => ok({ runId: 'run-1', deliveryId: null, messages: [], count: 0, timedOut: true, acknowledged: args[args.indexOf('--ack') + 1], ...extra });
+const withReceipt = (receipt, rest = {}) => ({ runId: 'run-1', deliveryId: null, messages: [], count: 0, timedOut: true, ...receipt, ...rest });
+
+test('RF2: intermediate ACK receipt uses the strict exact-delivery rule', async () => {
+  const cases = [['null', { acknowledged: null }], ['absent', {}], ['number', { acknowledged: 42 }], ['wrong string', { acknowledged: 'wrong' }]];
+  for (const [label, receipt] of cases) {
+    const r = await run(mock({ list: tasks('running'), show: shown(undefined), batches: [delivery('old', [noise(1)]), withReceipt(receipt)] }));
+    assert.equal(r.state, 'running', label);
+    assert.equal(r.ack.status, 'failed', label); assert.equal(r.ack.delivery_id, 'old', label);
+    assert.equal(r.ack_failures.length, 1, label); assert.equal(r.ack_failures[0].delivery_id, 'old', label);
+  }
+  const good = await run(mock({ list: tasks('running'), show: shown(undefined), batches: [delivery('old', [noise(1)]), acked()] }));
+  assert.deepEqual(good.ack, { delivery_id: 'old', status: 'acknowledged' }); assert.ok(!good.ack_failures);
+});
+
+test('RF2: earlier ACK failure survives a later successful final ACK and the worker_done verdict is unchanged', async () => {
+  const m = mock({ list: tasks('running'), show: shown(undefined), batches: [delivery('old', [noise(1)]), ok({ ...delivery('done', [done()]), acknowledged: 'wrong' })] });
+  const r = await run(m);
+  assert.equal(r.state, 'completed'); assert.equal(r.succeeded, true); assert.equal(r.outcome, 'succeeded');
+  assert.deepEqual(r.ack, { delivery_id: 'done', status: 'acknowledged' });
+  assert.deepEqual(r.ack_failures.map((f) => f.delivery_id), ['old']);
+  // failed final ACK too: both preserved, verdict still authoritative
+  const m2 = mock({ list: tasks('running'), show: shown(undefined), batches: [delivery('old', [noise(1)]), ok({ ...delivery('done', [done()]), acknowledged: null })], ackFail: true });
+  const r2 = await run(m2);
+  assert.equal(r2.state, 'completed'); assert.equal(r2.ack.status, 'failed'); assert.equal(r2.ack_failures[0].delivery_id, 'old');
+});
+
+test('RF2: malformed history fails safely when no worker_done was validated', async () => {
+  const cases = [['wrong run', { runId: 'other', messages: [], count: 0 }], ['messages object', { runId: 'run-1', messages: { a: 1 } }],
+    ['null row', { runId: 'run-1', messages: [null] }], ['empty row', { runId: 'run-1', messages: [{}] }],
+    ['invalid row', { runId: 'run-1', messages: [{ id: 5, type: 'worker_done' }] }]];
+  for (const [label, result] of cases) {
+    const m = mock({ list: tasks('running'), show: shown(undefined), batches: [] });
+    const r = await waitForOrca(config, id, opts, async (b, args, cwd, t) => (args.includes('--all') ? ok(result) : m.process(b, args, cwd, t)));
+    assert.equal(r.state, 'unknown', label); assert.equal(r.succeeded, false, label);
+    assert.ok(['run_mismatch', 'malformed_result'].includes(r.error.code), label); assert.equal(r.history_check, 'failed', label);
+  }
+  // normal empty history and unavailable history stay running
+  assert.equal((await run(mock({ list: tasks('running'), show: shown(undefined) }))).state, 'running');
+  const m = mock({ list: tasks('running'), show: shown(undefined) });
+  const unavailable = await waitForOrca(config, id, opts, async (b, args, cwd, t) => (args.includes('--all') ? fail('boom', 'x') : m.process(b, args, cwd, t)));
+  assert.equal(unavailable.state, 'running');
+  // a validated worker_done is not overridden by a malformed history (history is never read)
+  const done1 = await run(mock({ list: tasks('running'), show: shown(undefined), batches: [delivery('d1', [done()])], history: { wrong: 1 } }));
+  assert.equal(done1.state, 'completed');
+});
+
+test('RF2: malformed consuming rows are rejected before any ACK', async () => {
+  for (const row of [{}, { id: 'x' }, { type: 'worker_done' }, { id: '', type: 'heartbeat' }, { id: 'x', type: 7 }, { id: 3, type: 'heartbeat' }]) {
+    const m = mock({ list: tasks('running'), show: shown(undefined), batches: [ok({ runId: 'run-1', deliveryId: 'dbad', messages: [noise(1), row], count: 2 })] });
+    const r = await run(m);
+    assert.equal(r.state, 'unknown', JSON.stringify(row)); assert.equal(r.error.code, 'malformed_result');
+    assert.ok(!checks(m).some((c) => c.args.includes('--ack')), JSON.stringify(row));
+  }
 });
