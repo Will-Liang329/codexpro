@@ -22,7 +22,7 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { resolveHandoffControl } from "./handoffControl.js";
-import { launchOrca, OrcaLaunchError } from "./executionBackend.js";
+import { launchOrca, OrcaLaunchError, waitForOrca } from "./executionBackend.js";
 
 async function orcaHandoffResult(config: CodexProConfig, workspace: Workspace, args: {
   plan: string; agent?: string; model?: string; reasoning_effort?: string; title?: string; append?: boolean;
@@ -36,6 +36,29 @@ async function orcaHandoffResult(config: CodexProConfig, workspace: Workspace, a
     if (!(error instanceof OrcaLaunchError)) throw error;
     return { ...textResult(error.message, error.receipt), isError: true };
   }
+}
+
+const ORCA_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+
+async function orcaWaitResult(config: CodexProConfig, workspace: Workspace, args: {
+  orca_run_id?: string; orca_task_id?: string; orca_dispatch_id?: string; orca_coordinator_handle?: string;
+  max_wait_seconds?: number; poll_ms?: number;
+}): Promise<any> {
+  const ids = { runId: args.orca_run_id, taskId: args.orca_task_id, dispatchId: args.orca_dispatch_id, coordinatorHandle: args.orca_coordinator_handle };
+  const bad = Object.entries(ids).filter(([, v]) => typeof v !== "string" || !ORCA_ID.test(v)).map(([k]) => k);
+  if (bad.length) {
+    return { ...textResult(`Orca wait requires orca_run_id, orca_task_id, orca_dispatch_id and orca_coordinator_handle from the launch receipt (invalid: ${bad.join(", ")}).`,
+      { backend: "orca", state: "unknown", awaited_terminal: false, succeeded: false, invalid_fields: bad }), isError: true };
+  }
+  const result = await waitForOrca(config, ids as { runId: string; taskId: string; dispatchId: string; coordinatorHandle: string },
+    { maxWaitMs: limitInt(args.max_wait_seconds, 20, 1, 60) * 1000, pollMs: limitInt(args.poll_ms, 1000, 250, 5000), workspace: workspace.root });
+  const lines = [`# Wait For Handoff (Orca)`, "", `State: ${result.state}${result.outcome ? ` (outcome ${result.outcome})` : ""}`,
+    `Run: ${result.runId}; Task: ${result.taskId}; Dispatch: ${result.dispatchId}`,
+    ...(result.summary ? ["", String(result.summary)] : []),
+    ...(result.evidence_conflict ? ["", `Evidence conflict: ${(result.evidence_conflict as string[]).join("; ")}`] : []),
+    ...(result.error ? ["", `Error: ${(result.error as any).message}`] : []),
+    ...(result.next_poll_after_seconds ? ["", `Re-poll after ~${result.next_poll_after_seconds}s.`] : [])];
+  return { ...textResult(lines.join("\n"), { workspace_id: workspace.id, root: workspace.root, ...result }), ...(result.error ? { isError: true } : {}) };
 }
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -2577,7 +2600,7 @@ export function createCodexProServer(
     {
       title: "Wait For Handoff",
       description:
-        "Read-only long-poll of the local handoff run state so ChatGPT can stay the planner/reviewer while a local executor runs. Reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts. It never starts processes or runs shell commands; it only observes local handoff state written by execute-handoff/watch-handoff/loop-handoff.",
+        "Read-only long-poll of the local handoff run state (or, when the four orca_* launch-receipt identity fields are supplied, of the exact Orca Run/Task/Dispatch via Orca's public CLI; Orca worker_done is the authoritative completion and the only mutation is the mailbox ACK) so ChatGPT can stay the planner/reviewer while a local executor runs. Reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts. It never starts processes or runs shell commands; it only observes local handoff state written by execute-handoff/watch-handoff/loop-handoff.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         plan_hash: z.string().optional().describe("Expected current-plan.md hash. If set, only a terminal run with this plan_hash counts as completed."),
@@ -2586,7 +2609,11 @@ export function createCodexProServer(
         poll_ms: z.number().int().min(250).max(5000).optional().describe("Poll interval in milliseconds. Default: 1000."),
         include_diff: z.boolean().optional().describe("Include the implementation diff excerpt when completed. Default: true."),
         include_log_excerpt: z.boolean().optional().describe("Include the tail of execution-log.jsonl when completed. Default: true."),
-        include_tests: z.boolean().optional().describe("Include the loop-tests.txt excerpt when completed. Default: true.")
+        include_tests: z.boolean().optional().describe("Include the loop-tests.txt excerpt when completed. Default: true."),
+        orca_run_id: z.string().optional().describe("Orca backend only: runId from the handoff_to_agent launch receipt. Supply all four orca_* fields to wait on an Orca worker; omit them for AHR."),
+        orca_task_id: z.string().optional().describe("Orca backend only: taskId from the launch receipt."),
+        orca_dispatch_id: z.string().optional().describe("Orca backend only: dispatchId from the launch receipt."),
+        orca_coordinator_handle: z.string().optional().describe("Orca backend only: coordinator_handle from the launch receipt.")
       },
       annotations: { ...READ_ONLY_ANNOTATIONS, idempotentHint: false },
       _meta: {
@@ -2597,6 +2624,9 @@ export function createCodexProServer(
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (args.orca_run_id !== undefined || args.orca_task_id !== undefined || args.orca_dispatch_id !== undefined || args.orca_coordinator_handle !== undefined) {
+        return orcaWaitResult(config, workspace, args);
+      }
       const maxWaitSeconds = limitInt(args.max_wait_seconds, 20, 1, 60);
       const pollMs = limitInt(args.poll_ms, 1000, 250, 5000);
       const includeDiff = parseBool(args.include_diff, true);
