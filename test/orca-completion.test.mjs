@@ -38,7 +38,7 @@ const shown = (outcome = 'succeeded', extra = {}) => ({
 const tasks = (status = 'completed') => ({ tasks: [{ id: 'other', status: 'failed', run_id: 'run-1' }, { id: 'task-1', run_id: 'run-1', status, spec: 'x' }] });
 
 // batches: array of check results (each consumed in order); extra overrides for other commands
-function mock({ batches = [], show = shown(), list = tasks(), ackFail = false, onCheck, history = [] } = {}) {
+function mock({ batches = [], show = shown(), list = tasks(), ackFail = false, onCheck, history = [], historyFail } = {}) {
   const calls = [];
   let i = 0;
   const process = async (binary, args, cwd, timeout) => {
@@ -46,8 +46,8 @@ function mock({ batches = [], show = shown(), list = tasks(), ackFail = false, o
     const cmd = args[1];
     if (cmd === 'check') {
       onCheck?.(args, calls);
-      if (args.includes('--all')) return ok({ runId: 'run-1', messages: history, count: history.length });
-      if (args.includes('--peek')) return ackFail ? fail('boom', 'ack failed') : ok({ runId: 'run-1', messages: [], count: 0, acknowledged: args[args.indexOf('--ack') + 1] });
+      if (args.includes('--all')) return historyFail ?? ok({ runId: 'run-1', messages: history, count: history.length });
+      if (args.includes('--peek')) return ackFail ? fail(typeof ackFail === 'string' ? ackFail : 'boom', 'ack failed') : ok({ runId: 'run-1', messages: [], count: 0, acknowledged: args[args.indexOf('--ack') + 1] });
       const b = batches[i++] ?? { runId: 'run-1', deliveryId: null, messages: [], count: 0, timedOut: true };
       return typeof b === 'function' ? b(args) : b.stdout ? b : ok(b);
     }
@@ -440,5 +440,48 @@ test('RF2: malformed consuming rows are rejected before any ACK', async () => {
     const r = await run(m);
     assert.equal(r.state, 'unknown', JSON.stringify(row)); assert.equal(r.error.code, 'malformed_result');
     assert.ok(!checks(m).some((c) => c.args.includes('--ack')), JSON.stringify(row));
+  }
+});
+
+const FORBIDDEN = ['worker-start', 'worker-release', 'worker-stop', 'worker-abandon', 'task-update', 'dispatch', 'send', 'reply', '--retry-of'];
+const noMutation = (m) => { for (const c of m.calls) for (const f of FORBIDDEN) assert.ok(!c.args.includes(f), f); };
+const attributable = { id: 'msg-q', run_id: 'run-1', type: 'question', subject: 'Q', body: 'b', payload: JSON.stringify({ taskId: 'task-1' }) };
+
+test('RF3 P2-6 A: consuming check consumer_fenced stays unknown with no ACK, history or fallback', async () => {
+  const m = mock({ batches: [fail('consumer_fenced', 'fenced')] });
+  const r = await run(m);
+  assert.equal(r.state, 'unknown'); assert.equal(r.error.code, 'consumer_fenced');
+  assert.deepEqual(verbs(m), ['check']); noMutation(m);
+});
+
+test('RF3 P2-6 B: history consumer_fenced with no worker_done is unknown/error, not running', async () => {
+  const m = mock({ show: { stdout: 'x', exitCode: 1 }, historyFail: fail('consumer_fenced', 'synthetic failure') });
+  const r = await run(m);
+  assert.equal(r.state, 'unknown'); assert.equal(r.error.code, 'consumer_fenced'); assert.equal(r.history_check, 'failed');
+  assert.equal(r.succeeded, false); assert.equal(r.awaited_terminal, false); noMutation(m);
+  // ordinary history unavailability stays best-effort
+  const plain = await run(mock({ historyFail: fail('orca_error', 'down'), show: shown('in_progress'), list: tasks('dispatched') }));
+  assert.equal(plain.state, 'running');
+});
+
+test('RF3 P2-6 C: final ACK consumer_fenced with only a blocker is unknown/error and keeps ACK evidence', async () => {
+  const m = mock({ batches: [delivery('pending', [attributable])], ackFail: 'consumer_fenced', show: shown('in_progress'), list: tasks('dispatched') });
+  const r = await run(m);
+  assert.equal(r.state, 'unknown'); assert.equal(r.error.code, 'consumer_fenced'); assert.equal(r.succeeded, false);
+  assert.equal(r.ack.status, 'failed'); assert.equal(r.ack.code, 'consumer_fenced'); assert.equal(r.pending_messages[0].id, 'msg-q');
+  assert.ok(!verbs(m).includes('worker-show') && !m.calls.some((c) => c.args.includes('--all'))); noMutation(m);
+  // earlier ACK failures are kept
+  const m2 = mock({ batches: [ok({ ...delivery('old', [noise(1)]), acknowledged: null }), delivery('pending', [attributable])], ackFail: 'consumer_fenced' });
+  const r2 = await run(m2);
+  assert.equal(r2.error.code, 'consumer_fenced');
+});
+
+test('RF3 P2-6 D/E: validated worker_done stays authoritative over a final ACK consumer_fenced', async () => {
+  for (const outcome of ['succeeded', 'failed']) {
+    const m = mock({ batches: [delivery('d1', [done({ outcome })])], ackFail: 'consumer_fenced', show: shown(outcome), list: tasks(outcome === 'succeeded' ? 'completed' : 'failed') });
+    const r = await run(m);
+    assert.equal(r.state, outcome === 'succeeded' ? 'completed' : 'failed'); assert.equal(r.outcome, outcome);
+    assert.equal(r.ack.status, 'failed'); assert.equal(r.ack.code, 'consumer_fenced'); assert.equal(r.error, undefined);
+    noMutation(m);
   }
 });
