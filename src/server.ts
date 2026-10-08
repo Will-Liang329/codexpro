@@ -440,6 +440,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "import_file",
   "bash",
   "export_pro_context",
+  "wait_for_handoff",
   "handoff_to_agent",
   "handoff_to_codex"
 ]);
@@ -2600,7 +2601,7 @@ export function createCodexProServer(
     {
       title: "Wait For Handoff",
       description:
-        "Read-only long-poll of the local handoff run state (or, when the four orca_* launch-receipt identity fields are supplied, of the exact Orca Run/Task/Dispatch via Orca's public CLI; Orca worker_done is the authoritative completion and the only mutation is the mailbox ACK) so ChatGPT can stay the planner/reviewer while a local executor runs. Reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts. It never starts processes or runs shell commands; it only observes local handoff state written by execute-handoff/watch-handoff/loop-handoff.",
+        "Long-poll for a handoff result so ChatGPT can stay the planner/reviewer while an executor runs. AHR path (no orca_* fields): file-read-only; reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts written by execute-handoff/watch-handoff/loop-handoff, and starts no processes. Orca path (all four orca_* launch-receipt identity fields): invokes Orca's public CLI for the exact Run/Task/Dispatch; Orca worker_done is the authoritative completion, and the only expected mutation is the exact mailbox delivery ACK. It never starts, retries, releases or restarts workers.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         plan_hash: z.string().optional().describe("Expected current-plan.md hash. If set, only a terminal run with this plan_hash counts as completed."),
@@ -2615,7 +2616,7 @@ export function createCodexProServer(
         orca_dispatch_id: z.string().optional().describe("Orca backend only: dispatchId from the launch receipt."),
         orca_coordinator_handle: z.string().optional().describe("Orca backend only: coordinator_handle from the launch receipt.")
       },
-      annotations: { ...READ_ONLY_ANNOTATIONS, idempotentHint: false },
+      annotations: { ...READ_ONLY_ANNOTATIONS, readOnlyHint: false, idempotentHint: false },
       _meta: {
         ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Waiting for local handoff result...",

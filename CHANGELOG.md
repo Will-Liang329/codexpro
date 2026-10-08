@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hardened the Orca `wait_for_handoff` completion bridge: the tool is no longer advertised read-only (Orca path performs the exact mailbox ACK) and is hidden in the connection-test profile; unattributed questions/escalations no longer block completion; ACKed `worker_done` history recovery no longer depends on Task/Dispatch cross-checks; `reportPath` is symlink-confined; malformed `messages` and untrusted ACK receipts are rejected.
 - Updated transitive brace-expansion and ip-address dependencies to patched releases; full and production-only dependency audits report zero known vulnerabilities.
 - Mark replacing handoff writes and Pro context exports as destructive in MCP tool annotations; keep the restored self-test probe non-destructive.
 

@@ -923,7 +923,7 @@ try {
   for (const expected of ['read', 'tree', 'search', 'load_skill']) {
     if (!names.includes(expected)) throw new Error(`connection-test missing ${expected}; got ${names.join(', ')}`);
   }
-  for (const hidden of ['codexpro', 'codexpro_self_test', 'write', 'edit', 'apply_patch', 'bash', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+  for (const hidden of ['codexpro', 'codexpro_self_test', 'write', 'edit', 'apply_patch', 'bash', 'export_pro_context', 'wait_for_handoff', 'handoff_to_agent', 'handoff_to_codex']) {
     if (names.includes(hidden)) throw new Error(`connection-test exposed ${hidden}; got ${names.join(', ')}`);
   }
   for (const tool of tools) {
