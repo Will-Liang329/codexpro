@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import { redactSensitiveText } from "./redact.js";
+import { ORCA_HANDLE, closeCoordinatorTerminal, type CoordinatorCleanupResult } from "./orcaCoordinatorCleanup.js";
 
 export type ExecutionBackend = "ahr" | "orca";
 
@@ -122,7 +123,11 @@ export async function launchOrca(config: Pick<CodexProConfig, "orcaExecutable" |
 // ---------------------------------------------------------------------------
 
 export interface OrcaWaitIdentity { runId: string; taskId: string; dispatchId: string; coordinatorHandle: string }
-export interface OrcaWaitOptions { maxWaitMs: number; pollMs: number; workspace?: string }
+export interface OrcaWaitOptions {
+  maxWaitMs: number; pollMs: number; workspace?: string;
+  /** Close the exact Run coordinator terminal once a terminal verdict is proven safe (see `coordinator_cleanup`). Default off. */
+  closeCoordinator?: boolean;
+}
 
 const WAIT_TYPES = ["worker_done", "question", "escalation"];
 const MAX_BATCHES = 50;
@@ -204,6 +209,8 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   let ignored = 0;
   let matched: { message: Record<string, any>; payload: Record<string, any>; deliveryId?: string; recovered?: boolean } | undefined;
   let blocked: Record<string, unknown> | undefined;
+  // True once a consuming check reported an empty mailbox (no delivery left), so history can only hold already-ACKed rows.
+  let drained = false;
 
   const consider = (raw: unknown, deliveryId: string | undefined): void => {
     const message = object(raw);
@@ -266,6 +273,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       }
       const deliveryId = typeof result.deliveryId === "string" && result.deliveryId ? result.deliveryId : undefined;
       if (messages.length === 0) {
+        if (!deliveryId) drained = true;
         if (result.timedOut === true || result.cancelled === true || remaining === 0 || !deliveryId) break;
         ackPending = deliveryId; continue;
       }
@@ -371,6 +379,24 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     const files = Array.isArray(matched.payload.filesModified)
       ? matched.payload.filesModified.filter((f: unknown) => typeof f === "string").slice(0, LIST_MAX).map((f: string) => clip(f, 500)).filter(Boolean) : undefined;
     const reportPath = await safeReportPath(matched.payload.reportPath, options.workspace);
+    // Supporting lifecycle work after the verdict is fixed: only a verdict backed by an exactly ACKed delivery (or by a
+    // fully drained mailbox, for history recovery) with no conflicting evidence may close the coordinator terminal.
+    // Fail closed on identity: the worker-show/task-list cross-check must have succeeded and established a well-formed
+    // Dispatch assignee, which is the only proof that the coordinator handle is not the worker terminal.
+    let coordinatorCleanup: CoordinatorCleanupResult | { status: "skipped"; coordinator_handle: string; reason: string } | undefined;
+    if (options.closeCoordinator) {
+      const reason = conflicts.length ? "evidence_conflict"
+        : ackFence ? "consumer_fenced"
+        : ackFailures.length ? "ack_failure"
+        : pending.length ? "pending_question_or_escalation"
+        : assignee === coordinatorHandle ? "handle_is_worker_terminal"
+        : crossStatus !== "consistent" ? "cross_check_unavailable"
+        : !assignee || !ORCA_HANDLE.test(assignee) ? "assignee_unverified"
+        : matched.recovered ? (drained ? undefined : "mailbox_not_drained")
+        : matched.deliveryId && ack?.status === "acknowledged" && ack.delivery_id === matched.deliveryId ? undefined : "ack_not_confirmed";
+      coordinatorCleanup = reason ? { status: "skipped", coordinator_handle: coordinatorHandle, reason }
+        : await closeCoordinatorTerminal(config, { runId, coordinatorHandle, workerHandles: assignee ? [assignee] : [] }, process, cwd);
+    }
     return { ...common, state: outcome === "succeeded" ? "completed" : "failed", awaited_terminal: true,
       awaited_completed: outcome === "succeeded", succeeded: outcome === "succeeded", outcome,
       worker_done: { message_id: clip(matched.message.id, 80), ...(matched.deliveryId ? { delivery_id: matched.deliveryId } : {}), ...(matched.recovered ? { recovered_from_history: true } : {}), created_at: clip(matched.message.created_at, 40) },
@@ -378,7 +404,8 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       ...(files ? { filesModified: files } : {}),
       ...(reportPath ? { reportPath } : matched.payload.reportPath !== undefined ? { reportPath_rejected: true } : {}),
       cross_check: { status: crossStatus, ...(taskStatus ? { task_status: taskStatus } : {}), ...(crossError ? { error: crossError } : {}) },
-      ...(conflicts.length ? { evidence_conflict: [...new Set(conflicts)] } : {}) };
+      ...(conflicts.length ? { evidence_conflict: [...new Set(conflicts)] } : {}),
+      ...(coordinatorCleanup ? { coordinator_cleanup: coordinatorCleanup } : {}) };
   }
 
   const settled = taskStatus === "completed" || taskStatus === "failed";

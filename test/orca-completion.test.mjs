@@ -261,7 +261,7 @@ else out({ tasks: [{ id: 'task-1', run_id: 'run-1', status: 'completed' }] });
   await fs.chmod(fake, 0o755);
   const client = new Client({ name: 'orca-wait-test', version: '1.0' });
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/stdio.js'), '--root', dir],
-    env: { ...process.env, CODEXPRO_EXECUTION_BACKEND: 'orca', CODEXPRO_ORCA_BINARY: fake, CODEXPRO_BASH_MODE: 'off' }, stderr: 'pipe' });
+    env: { ...process.env, CODEXPRO_EXECUTION_BACKEND: 'orca', CODEXPRO_ORCA_BINARY: fake, CODEXPRO_BASH_MODE: 'off', CODEXPRO_ORCA_CLOSE_COORDINATOR: '0' }, stderr: 'pipe' });
   try {
     await client.connect(transport);
     const partial = await client.callTool({ name: 'wait_for_handoff', arguments: { orca_run_id: 'run-1', max_wait_seconds: 1 } });

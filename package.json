@@ -70,7 +70,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "npm run build && npm run smoke && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs",
+    "check": "npm run build && npm run smoke && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs test/orca-coordinator-cleanup.test.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "node scripts/release-guard.mjs",
     "start": "node dist/stdio.js",
@@ -98,7 +98,8 @@
     "package:smoke": "node scripts/package-install-smoke.mjs",
     "release:check": "npm run release:guard && npm run build && npm run smoke && npm run stress && npm audit --audit-level=high && npm run release:pack && npm run package:smoke",
     "release:publish": "node scripts/release-publish.mjs",
-    "test:execution-backends": "npm run build && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs",
+    "test:execution-backends": "npm run build && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs test/orca-coordinator-cleanup.test.mjs",
+    "orca:cleanup-coordinators": "node scripts/orca-coordinator-cleanup.mjs",
     "smoke:orca": "npm run build && node scripts/orca-integration-smoke.mjs"
   },
   "dependencies": {

@@ -16,6 +16,8 @@ CODEXPRO_ORCA_BINARY=orca
 CODEXPRO_ORCA_TIMEOUT_MS=60000
 ```
 
+`CODEXPRO_ORCA_CLOSE_COORDINATOR` (default `1`; `0` disables) controls the post-completion close of the exact Run coordinator terminal described in `docs/orca-completion-bridge.md`; it never affects the completion verdict.
+
 `CODEXPRO_ORCA_BINARY` may be an absolute path or a command on the service PATH. No installation path is hardcoded. The timeout is the worker readiness deadline; each subprocess has an additional 10-second transport margin. Missing, interrupted, nonzero, malformed, or non-ready responses are errors; CodexPro never automatically retries or falls back.
 
 The initial default is `ahr`. Invalid backend values fail startup explicitly. `server_config` reports the selected backend, executable, and timeout. Deployment must retain the existing allowed roots, loopback/auth settings, and service environment.

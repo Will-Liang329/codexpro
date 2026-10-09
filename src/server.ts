@@ -51,7 +51,8 @@ async function orcaWaitResult(config: CodexProConfig, workspace: Workspace, args
       { backend: "orca", state: "unknown", awaited_terminal: false, succeeded: false, invalid_fields: bad }), isError: true };
   }
   const result = await waitForOrca(config, ids as { runId: string; taskId: string; dispatchId: string; coordinatorHandle: string },
-    { maxWaitMs: limitInt(args.max_wait_seconds, 20, 1, 60) * 1000, pollMs: limitInt(args.poll_ms, 1000, 250, 5000), workspace: workspace.root });
+    { maxWaitMs: limitInt(args.max_wait_seconds, 20, 1, 60) * 1000, pollMs: limitInt(args.poll_ms, 1000, 250, 5000), workspace: workspace.root,
+      closeCoordinator: config.orcaCloseCoordinator });
   const lines = [`# Wait For Handoff (Orca)`, "", `State: ${result.state}${result.outcome ? ` (outcome ${result.outcome})` : ""}`,
     `Run: ${result.runId}; Task: ${result.taskId}; Dispatch: ${result.dispatchId}`,
     ...(result.summary ? ["", String(result.summary)] : []),
@@ -1192,6 +1193,7 @@ export function createCodexProServer(
         executionBackend: config.executionBackend,
         orcaExecutable: config.orcaExecutable,
         orcaTimeoutMs: config.orcaTimeoutMs,
+        orcaCloseCoordinator: config.orcaCloseCoordinator,
         toolMode: config.toolMode,
         exposeAbsolutePaths: config.exposeAbsolutePaths,
         toolCards: config.toolCards,
@@ -2601,7 +2603,7 @@ export function createCodexProServer(
     {
       title: "Wait For Handoff",
       description:
-        "Long-poll for a handoff result so ChatGPT can stay the planner/reviewer while an executor runs. AHR path (no orca_* fields): file-read-only; reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts written by execute-handoff/watch-handoff/loop-handoff, and starts no processes. Orca path (all four orca_* launch-receipt identity fields): invokes Orca's public CLI for the exact Run/Task/Dispatch; Orca worker_done is the authoritative completion, and the only expected mutation is the exact mailbox delivery ACK. It never starts, retries, releases or restarts workers.",
+        "Long-poll for a handoff result so ChatGPT can stay the planner/reviewer while an executor runs. AHR path (no orca_* fields): file-read-only; reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts written by execute-handoff/watch-handoff/loop-handoff, and starts no processes. Orca path (all four orca_* launch-receipt identity fields): invokes Orca's public CLI for the exact Run/Task/Dispatch; Orca worker_done is the authoritative completion, and the only expected mutations are the exact mailbox delivery ACK and, after a terminal verdict backed by that ACK (or by already-ACKed history), a best-effort close of the exact Run coordinator terminal (reported as coordinator_cleanup; it never changes the verdict). It never starts, retries, releases or restarts workers.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         plan_hash: z.string().optional().describe("Expected current-plan.md hash. If set, only a terminal run with this plan_hash counts as completed."),
