@@ -101,7 +101,53 @@ When an exact authoritative `worker_done` was already validated, a later final-A
 
 The completion bridge never performs worker start/retry/release/restart/fallback as part of waiting. Orca owns Run/Task/Dispatch/worker lifecycle. Terminal/session retention, reuse, release, TTL/caps/LRU and future session-affinity policy remain separate Router/lifecycle concerns.
 
-Retained terminals are not a completion-bridge defect.
+Retained worker terminals are not a completion-bridge defect. Settled **coordinator** terminals are handled by the cleanup below.
+
+## Coordinator terminal cleanup
+
+Orca binds the mailbox, consumer generation and fence to the Run (`run.coordinator_handle`), not to terminal liveness. `.ai-bridge/orca-coordinator-lifecycle-experiment.md` showed that after a matching `worker_done` is consumed and exactly ACKed, closing the coordinator terminal still lets a repeat `wait_for_handoff` return `completed` through history recovery. `launchOrca` creates one coordinator terminal per handoff, so without cleanup every finished handoff leaves a shell behind.
+
+`wait_for_handoff` therefore closes the coordinator after the verdict is fixed (`CODEXPRO_ORCA_CLOSE_COORDINATOR`, default on, `0` disables):
+
+- the result reports it as `coordinator_cleanup` = `{status, coordinator_handle, reason?, code?, message?}` with `status` one of `closed`, `already_gone`, `skipped`, `failed`;
+- the close is `orchestration run-show --id <run>` (the handle must still be the Run's `coordinator_handle`), then `terminal close --terminal <exact handle> --tab`. Never `--worktree ... --all`, never a worker terminal (also refused if the handle equals the Dispatch assignee). Identity fails closed: cleanup needs a successful `worker-show` + `task-list` cross-check (`cross_check.status=consistent`) that establishes a well-formed Dispatch assignee terminal; otherwise it is skipped with `cross_check_unavailable` or `assignee_unverified`, and the verdict stays authoritative;
+- it runs only for `state=completed|failed` with `awaited_terminal=true`, and only when either the matching delivery was exactly ACKed, or the verdict was recovered from history after a consuming check observed an empty mailbox (so history can only hold ACKed rows);
+- it is skipped (`status=skipped`, with `reason`) on `evidence_conflict`, `cross_check_unavailable`, `assignee_unverified`, any ACK failure or unconfirmed ACK, `consumer_fenced`, an attributable pending question/escalation, an undrained mailbox during history recovery, or an unverifiable Run binding. `running`, `blocked` and `unknown` results never reach cleanup and have no `coordinator_cleanup` field;
+- `terminal_handle_stale` is `already_gone` (the desired end state), so a repeat wait after the close is harmless;
+- a failed or skipped close never rewrites a valid verdict and never triggers worker start/retry/release/fallback. The close is attempted once per call, with no retry.
+
+Runtime semantics to be aware of: this adds one more mutation to `wait_for_handoff` (a best-effort terminal close), and the coordinator terminal can no longer be used interactively after a terminal verdict. The retained `orca_coordinator_handle` remains valid for repeat waits.
+
+### One-time backlog cleanup
+
+Historical coordinators from before this change can be closed with an operator script. It is **dry-run by default**:
+
+```sh
+npm run build
+npm run orca:cleanup-coordinators                       # dry-run: read-only Orca calls, lists candidates and exclusions
+npm run orca:cleanup-coordinators -- --json             # machine-readable report
+npm run orca:cleanup-coordinators -- --apply            # closes the proven candidates, one exact handle at a time
+```
+
+Options: `--min-age-minutes` (default 60, applies to both the Run and the terminal's last output), `--max-close` (default 50, apply batch size), `--max-runs` (default 1000; hitting it with Runs remaining makes `--apply` refuse), `--title <exact title>` (repeatable; default plain shells `CodexPro coordinator`, `zsh`, `bash`, `sh`, `fish`), `--orca-binary`.
+
+A coordinator handle is a candidate only when **every** Run it coordinates is proven settled from Orca state, and the terminal itself is a live, idle, plain-shell coordinator. Everything else is excluded with a reason:
+
+- Run: not legacy; has Tasks, all `completed|failed`; every Task has a Dispatch; every Dispatch is `completed|failed` with a matching `succeeded|failed` outcome and no pending worker release; every Dispatch has a matching, `read`, correctly-attributed `worker_done` with the same outcome in the coordinator's history (`check --terminal <handle> --all`, read-only); no `question`/`escalation` anywhere in that history; history is the same Run and well-formed.
+- Terminal: present in `terminal list` and connected (missing/orphaned handles are reported as `already_gone`, never acted on); not the invoking terminal (`ORCA_TERMINAL_HANDLE`); not a worker terminal of any Dispatch; title is a plain shell (agent TUIs and untitled terminals are excluded); last output older than `--min-age-minutes`.
+- Any failed inventory read (`run-list`, `worker-list`, `terminal list`) aborts the scan. Apply re-verifies each handle against `run-show` and closes it by exact handle with `--tab`, treating `terminal_handle_stale` as already gone.
+
+**Inventory completeness (fail-closed).** The report carries `inventory_complete` and `inventory_gaps` (`<inventory>:<reason>`). Each inventory is complete only when its source proves the end of the data; otherwise the gap is reported in dry-run (the text output prints `INVENTORY INCOMPLETE`, and listed candidates are then not proven) and `--apply` refuses: zero `terminal close` calls, `results: []`, an `apply refused` warning, and exit code 3.
+
+| Inventory | Incomplete when |
+| --- | --- |
+| `runs` | `row_cap_reached` (`--max-runs` hit with Runs remaining; a cap exactly equal to the Run count is complete), `malformed_cursor`, `empty_page_with_cursor`, `cursor_not_advancing`, `page_limit_reached` (1000 pages) |
+| `workers` | `has_more_without_cursor`, `page_end_unproven` (`page.hasMore` missing or not boolean), `empty_page_with_cursor`, `cursor_not_advancing`, `page_limit_reached` |
+| `terminals` | `truncated`, `truncation_unproven` (`truncated` is not exactly `false`), `total_exceeds_listed` |
+
+`--max-close` is only a batch-size cap (`apply stopped at --max-close`, re-run to continue) and is not an inventory failure. To clear a `runs:row_cap_reached` gap, raise `--max-runs` above the number of Runs.
+
+The script runs Orca CLI calls with the `ORCA_*`/`TERM_PROGRAM*` terminal-attestation variables removed from the child environment (as the launchd-run service does), because Orca otherwise rejects consumer reads attested as another terminal (`consumer_fenced`). An individual ACK is not observable in history, so the backlog uses the `worker_done` message's `read` flag as its proxy; per the lifecycle experiment a closed coordinator can still consume and ACK later, so a missed ACK cannot be made worse by the close.
 
 ## Optional report artifacts
 

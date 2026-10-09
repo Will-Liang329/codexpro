@@ -17,6 +17,7 @@ export interface CodexProConfig {
   executionBackend: ExecutionBackend;
   orcaExecutable: string;
   orcaTimeoutMs: number;
+  orcaCloseCoordinator: boolean;
   defaultRoot: string;
   allowedRoots: string[];
   host: string;
@@ -337,6 +338,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     executionBackend: executionBackend(process.env.CODEXPRO_EXECUTION_BACKEND),
     orcaExecutable: process.env.CODEXPRO_ORCA_BINARY || "orca",
     orcaTimeoutMs: numberFrom(process.env.CODEXPRO_ORCA_TIMEOUT_MS, 60000, 1000, 120000),
+    orcaCloseCoordinator: boolFrom(process.env.CODEXPRO_ORCA_CLOSE_COORDINATOR, true),
     authToken,
     requireHttpToken,
     bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),
