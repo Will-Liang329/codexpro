@@ -8,15 +8,17 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_COORDINATOR_TITLES, runBacklogCleanup } from '../dist/orcaCoordinatorBacklog.js';
 
 const USAGE = `Usage: node scripts/orca-coordinator-cleanup.mjs [--apply] [--min-age-minutes 60] [--max-close 50]
-       [--max-runs 1000] [--title <exact terminal title>]... [--json] [--orca-binary orca]
+       [--max-runs 1000] [--title <exact terminal title>]... [--allow-unread-worker-done] [--json] [--orca-binary orca]
 
 Default is a read-only dry-run. --apply closes only handles proven safe (see docs/orca-completion-bridge.md).
 --apply refuses (exit 3, nothing closed) unless the Run, worker and terminal inventories are provably complete;
 hitting --max-runs with Runs remaining counts as incomplete. --max-close only caps the batch size.
+--allow-unread-worker-done (operator-only, off by default) waives ONLY the worker_done_unread exclusion for old
+settled Runs; every other proof stays mandatory. It does not change live wait_for_handoff cleanup.
 Titles default to plain shells: ${DEFAULT_COORDINATOR_TITLES.join(', ')}.`;
 
 export function parseArgs(argv) {
-  const options = { apply: false, json: false, minAgeMinutes: 60, maxClose: 50, maxRuns: 1000, titles: [], binary: process.env.CODEXPRO_ORCA_BINARY || 'orca' };
+  const options = { apply: false, json: false, minAgeMinutes: 60, maxClose: 50, maxRuns: 1000, allowUnreadWorkerDone: false, titles: [], binary: process.env.CODEXPRO_ORCA_BINARY || 'orca' };
   const number = (name, value, min) => {
     const n = Number(value);
     if (!Number.isInteger(n) || n < min) throw new Error(`${name} must be an integer >= ${min}`);
@@ -27,6 +29,7 @@ export function parseArgs(argv) {
     const next = () => { if (i + 1 >= argv.length) throw new Error(`${arg} requires a value`); return argv[++i]; };
     if (arg === '--apply') options.apply = true;
     else if (arg === '--json') options.json = true;
+    else if (arg === '--allow-unread-worker-done') options.allowUnreadWorkerDone = true;
     else if (arg === '--min-age-minutes') options.minAgeMinutes = number(arg, next(), 1);
     else if (arg === '--max-close') options.maxClose = number(arg, next(), 1);
     else if (arg === '--max-runs') options.maxRuns = number(arg, next(), 1);
@@ -54,11 +57,11 @@ const cleanProcess = (binary, args, cwd, timeoutMs) => new Promise((resolve, rej
 });
 
 function render(report) {
-  const lines = [`Orca coordinator backlog cleanup (${report.mode})`,
+  const lines = [`Orca coordinator backlog cleanup (${report.mode})${report.allow_unread_worker_done ? ' [--allow-unread-worker-done]' : ''}`,
     `Runs scanned: ${report.scanned_runs}; coordinator handles: ${report.coordinator_handles}; already gone: ${report.already_gone.length}`,
     `Candidates (proven safe): ${report.candidates.length}; excluded: ${report.excluded.length}`];
   if (!report.inventory_complete) lines.push(`  INVENTORY INCOMPLETE (${report.inventory_gaps.join(', ')}): candidates below are NOT proven; --apply will refuse and close nothing.`);
-  for (const c of report.candidates) lines.push(`  CANDIDATE ${c.coordinator_handle} runs=${c.run_ids.join(',')} title=${c.title ?? '-'}`);
+  for (const c of report.candidates) lines.push(`  CANDIDATE ${c.coordinator_handle} runs=${c.run_ids.join(',')} title=${c.title ?? '-'}${c.unread_worker_done_waived ? ' (unread worker_done waived)' : ''}`);
   const tally = {};
   for (const e of report.excluded) for (const r of e.reasons) tally[r.split(':')[0]] = (tally[r.split(':')[0]] ?? 0) + 1;
   for (const [reason, n] of Object.entries(tally).sort((a, b) => b[1] - a[1])) lines.push(`  excluded x${n}: ${reason}`);
@@ -76,6 +79,7 @@ async function main() {
   const report = await runBacklogCleanup(config, {
     apply: options.apply, minAgeMs: options.minAgeMinutes * 60_000, maxClose: options.maxClose, maxRuns: options.maxRuns,
     titles: options.titles.length ? options.titles : DEFAULT_COORDINATOR_TITLES, callerHandle,
+    allowUnreadWorkerDone: options.allowUnreadWorkerDone,
   }, cleanProcess);
   console.log(options.json ? JSON.stringify(report, null, 2) : render(report));
   if (report.mode === 'apply' && !report.inventory_complete) return 3;

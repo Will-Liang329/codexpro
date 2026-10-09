@@ -25,16 +25,27 @@ export interface BacklogOptions {
   titles: readonly string[];
   /** The invoking terminal; never touched even if it coordinates a settled Run. */
   callerHandle?: string;
+  /**
+   * Operator-only, one-time historical policy: accept a matching `worker_done` that is still unread as sufficient
+   * evidence. Waives ONLY the `worker_done_unread` exclusion; every other proof stays mandatory. Default false.
+   */
+  allowUnreadWorkerDone?: boolean;
   now?: () => number;
   cwd?: string;
 }
 
 export const DEFAULT_COORDINATOR_TITLES = ["CodexPro coordinator", "zsh", "bash", "sh", "fish"] as const;
 
-export interface BacklogCandidate { coordinator_handle: string; run_ids: string[]; title: string | null; last_output_at: number | null }
+export interface BacklogCandidate {
+  coordinator_handle: string; run_ids: string[]; title: string | null; last_output_at: number | null;
+  /** True when the explicit unread waiver was what admitted this candidate (a matching worker_done had read=0). */
+  unread_worker_done_waived?: boolean;
+}
 export interface BacklogExclusion { coordinator_handle: string; run_ids: string[]; reasons: string[] }
 export interface BacklogReport {
   mode: "dry-run" | "apply";
+  /** Whether the operator-only unread `worker_done` waiver was supplied for this scan. */
+  allow_unread_worker_done: boolean;
   /** True only when Run, worker and terminal inventories were each read to a proven end. Apply requires it. */
   inventory_complete: boolean;
   /** Why the inventory is incomplete, as `<inventory>:<reason>`; empty when complete. */
@@ -82,7 +93,7 @@ async function paged<T>(read: (cursor?: string) => Promise<Page<T>>, max: number
 
 /** Proof that one Run is fully settled; returns the reasons it is NOT provably safe (empty = proven). */
 async function proveRunSettled(config: OrcaCleanupConfig, process: OrcaProcess, cwd: string, timeout: number,
-  run: Record<string, any>, handle: string, workers: Record<string, any>[]): Promise<string[]> {
+  run: Record<string, any>, handle: string, workers: Record<string, any>[], allowUnread: boolean, waived: { unread: boolean }): Promise<string[]> {
   const runId = run.id as string;
   const reasons: string[] = [];
   if (run.legacy === 1 || run.legacy === true) return ["legacy_run"];
@@ -137,7 +148,7 @@ async function proveRunSettled(config: OrcaCleanupConfig, process: OrcaProcess, 
     for (const m of matching) {
       const payload = asObject(typeof m.payload === "string" ? JSON.parse(m.payload) : m.payload);
       if (payload.outcome !== verdicts.get(w.dispatchId)) reasons.push("worker_done_outcome_mismatch");
-      if (m.read !== 1 && m.read !== true) reasons.push("worker_done_unread");
+      if (m.read !== 1 && m.read !== true) { if (allowUnread) waived.unread = true; else reasons.push("worker_done_unread"); }
       if (typeof m.from_handle === "string" && typeof w.agentTerminalHandle === "string" && m.from_handle !== w.agentTerminalHandle) reasons.push("worker_done_sender_mismatch");
     }
   }
@@ -233,15 +244,18 @@ export async function runBacklogCleanup(config: OrcaCleanupConfig, options: Back
       else if (now() - updated < options.minAgeMs) reasons.push("recent_run");
     }
     // The expensive per-Run proofs (task/history reads) only run for handles that already pass the cheap gates.
+    const waived = { unread: false };
     if (reasons.length === 0) {
-      for (const run of group) reasons.push(...await proveRunSettled(config, process, cwd, timeout, run, handle, workersByRun.get(run.id as string) ?? []));
+      for (const run of group) reasons.push(...await proveRunSettled(config, process, cwd, timeout, run, handle,
+        workersByRun.get(run.id as string) ?? [], options.allowUnreadWorkerDone === true, waived));
     }
     if (reasons.length) { excluded.push({ coordinator_handle: handle, run_ids: runIds, reasons: [...new Set(reasons)] }); continue; }
     candidates.push({ coordinator_handle: handle, run_ids: runIds, title: typeof terminal?.title === "string" ? terminal.title : null,
-      last_output_at: typeof terminal?.lastOutputAt === "number" ? terminal.lastOutputAt : null });
+      last_output_at: typeof terminal?.lastOutputAt === "number" ? terminal.lastOutputAt : null,
+      ...(waived.unread ? { unread_worker_done_waived: true } : {}) });
   }
 
-  const report: BacklogReport = { mode: options.apply ? "apply" : "dry-run", inventory_complete: gaps.length === 0, inventory_gaps: gaps, scanned_runs: runs.length, coordinator_handles: groups.size,
+  const report: BacklogReport = { mode: options.apply ? "apply" : "dry-run", allow_unread_worker_done: options.allowUnreadWorkerDone === true, inventory_complete: gaps.length === 0, inventory_gaps: gaps, scanned_runs: runs.length, coordinator_handles: groups.size,
     candidates, excluded, already_gone: alreadyGone, warnings };
   if (!options.apply) return report;
   if (gaps.length) { warnings.push(`apply refused: incomplete inventory (${gaps.join(", ")}); nothing was closed`); report.results = []; return report; }

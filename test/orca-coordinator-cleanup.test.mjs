@@ -460,6 +460,45 @@ test('backlog: excludes unresolved question/escalation and unsafe or missing wor
   assert.ok(!world.calls.some((c) => c.args[1] === 'close'));
 });
 
+test('backlog: unread worker_done is excluded by default and admitted only by the explicit flag, which waives nothing else', async () => {
+  const wd = (n, over = {}, row = {}) => ({ id: `m${n}`, run_id: `run_${n}`, type: 'worker_done', from_handle: `term_w${n}`, read: 0,
+    payload: JSON.stringify({ taskId: `task_${n}`, dispatchId: `ctx_${n}`, outcome: 'succeeded', ...over }), ...row });
+  const entries = () => [
+    settledRun(1, { history: [wd(1)] }),                                                         // unread only -> waived
+    settledRun(2, { history: [wd(2), { id: 'q', run_id: 'run_2', type: 'question', payload: '{}' }] }), // + question
+    settledRun(3, { history: [wd(3, {}, { from_handle: 'term_impostor' })] }),                    // + sender mismatch
+    settledRun(4, { history: [wd(4, { outcome: 'failed' })] }),                                  // + outcome mismatch
+    settledRun(5, { history: [wd(5, { dispatchId: 'ctx_other' })] }),                            // unread but not matching
+    settledRun(6, { history: [] }),                                                              // missing
+    settledRun(7, { history: [wd(7, {}, { read: 1 })] }),                                        // already read
+    settledRun(8, { history: [wd(8)], tasks: [{ id: 'task_8', run_id: 'run_8', status: 'running' }] }), // task unsettled
+  ];
+  const strict = await backlog(orcaWorld(entries()), {});
+  assert.equal(strict.allow_unread_worker_done, false);
+  assert.deepEqual(strict.candidates.map((c) => c.coordinator_handle), ['term_c7']);
+  assert.equal(strict.candidates[0].unread_worker_done_waived, undefined);
+  assert.deepEqual(excludedReasons(strict, 'term_c1'), ['worker_done_unread']);
+
+  const world = orcaWorld(entries());
+  const waived = await backlog(world, { allowUnreadWorkerDone: true, apply: true });
+  assert.equal(waived.allow_unread_worker_done, true);
+  assert.deepEqual(waived.candidates.map((c) => [c.coordinator_handle, c.unread_worker_done_waived]), [['term_c1', true], ['term_c7', undefined]]);
+  assert.deepEqual(excludedReasons(waived, 'term_c2'), ['question_or_escalation_present']);
+  assert.deepEqual(excludedReasons(waived, 'term_c3'), ['worker_done_sender_mismatch']);
+  assert.deepEqual(excludedReasons(waived, 'term_c4'), ['worker_done_outcome_mismatch']);
+  assert.deepEqual(excludedReasons(waived, 'term_c5'), ['worker_done_missing']);
+  assert.deepEqual(excludedReasons(waived, 'term_c6'), ['worker_done_missing']);
+  assert.ok(excludedReasons(waived, 'term_c8').some((r) => r.startsWith('task_not_settled')));
+  assert.ok(!excludedReasons(waived, 'term_c8').includes('worker_done_unread'));
+  assert.deepEqual(world.calls.filter((c) => c.args[1] === 'close').map((c) => c.args[c.args.indexOf('--terminal') + 1]), ['term_c1', 'term_c7']);
+
+  // Other gates stay mandatory under the flag: recent output, non-shell title and incomplete inventory.
+  const gated = await backlog(orcaWorld([settledRun(1, { history: [wd(1)], terminal: { handle: 'term_c1', title: 'claude', connected: true, lastOutputAt: 1 } })]), { allowUnreadWorkerDone: true });
+  assert.deepEqual(gated.candidates, []);
+  const refused = await backlog(orcaWorld(entries(), { truncated: true }), { allowUnreadWorkerDone: true, apply: true });
+  assert.equal(refused.inventory_complete, false); assert.deepEqual(refused.results, []);
+});
+
 test('backlog: a handle coordinating several Runs needs every Run proven settled', async () => {
   const a = settledRun(1);
   const b = settledRun(2, { run: { coordinator_handle: 'term_c1' }, tasks: [{ id: 'task_2', run_id: 'run_2', status: 'dispatched' }] });
@@ -606,6 +645,7 @@ const leaked = Object.keys(process.env).filter((k) => k.startsWith('ORCA_') || k
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ a: a.slice(0, 2).join(' '), full: a, leaked }) + '\\n');
 const out = (r) => process.stdout.write(JSON.stringify({ ok: true, result: r }));
 const w = ${JSON.stringify(world)};
+if (process.env.FAKE_UNREAD === '1') for (const m of w.history) m.read = 0;
 if (a[1] === 'run-list') out({ runs: [w.run], nextCursor: null });
 else if (a[1] === 'worker-list') out({ workers: w.workers, page: { hasMore: false } });
 else if (a[0] === 'terminal' && a[1] === 'list') out({ terminals: [{ ...w.terminal, lastOutputAt: 1 }], truncated: process.env.FAKE_TRUNCATED === '1' });
@@ -643,6 +683,14 @@ else { process.stdout.write('{"ok":false,"error":{"code":"unexpected"}}'); proce
     });
     calls = (await fs.readFile(log, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
     assert.ok(!calls.some((c) => c.a === 'terminal close'), 'refused apply must not close');
+    // Unread worker_done: excluded by default; only the explicit flag admits it (and it is reported as waived).
+    const unreadEnv = { ...env, FAKE_UNREAD: '1' };
+    const unreadDefault = JSON.parse((await execFileAsync(process.execPath, [script, '--orca-binary', fake, '--json', '--min-age-minutes', '5'], { env: unreadEnv })).stdout);
+    assert.equal(unreadDefault.allow_unread_worker_done, false); assert.deepEqual(unreadDefault.candidates, []);
+    assert.deepEqual(unreadDefault.excluded.map((e) => e.reasons), [['worker_done_unread']]);
+    const unreadFlag = JSON.parse((await execFileAsync(process.execPath, [script, '--orca-binary', fake, '--json', '--min-age-minutes', '5', '--allow-unread-worker-done'], { env: unreadEnv })).stdout);
+    assert.equal(unreadFlag.allow_unread_worker_done, true);
+    assert.deepEqual(unreadFlag.candidates.map((c) => [c.coordinator_handle, c.unread_worker_done_waived]), [['term_c1', true]]);
     await assert.rejects(execFileAsync(process.execPath, [script, '--orca-binary', fake, '--bogus'], { env }), (error) => error.code === 1 && /Unknown argument/.test(error.stderr));
     await assert.rejects(execFileAsync(process.execPath, [script, '--orca-binary', fake, '--max-close', '0'], { env }), (error) => error.code === 1);
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
