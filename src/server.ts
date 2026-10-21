@@ -56,6 +56,7 @@ async function orcaWaitResult(config: CodexProConfig, workspace: Workspace, args
   const lines = [`# Wait For Handoff (Orca)`, "", `State: ${result.state}${result.outcome ? ` (outcome ${result.outcome})` : ""}`,
     `Run: ${result.runId}; Task: ${result.taskId}; Dispatch: ${result.dispatchId}`,
     ...(result.summary ? ["", String(result.summary)] : []),
+    ...(result.blocked_reason ? ["", `Blocked (${result.blocked_reason}): ${result.blocked_guidance}`] : []),
     ...(result.evidence_conflict ? ["", `Evidence conflict: ${(result.evidence_conflict as string[]).join("; ")}`] : []),
     ...(result.error ? ["", `Error: ${(result.error as any).message}`] : []),
     ...(result.next_poll_after_seconds ? ["", `Re-poll after ~${result.next_poll_after_seconds}s.`] : [])];

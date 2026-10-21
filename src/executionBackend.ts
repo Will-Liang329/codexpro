@@ -127,9 +127,15 @@ export interface OrcaWaitOptions {
   maxWaitMs: number; pollMs: number; workspace?: string;
   /** Close the exact Run coordinator terminal once a terminal verdict is proven safe (see `coordinator_cleanup`). Default off. */
   closeCoordinator?: boolean;
+  /** Pause before re-reading Orca to confirm a `blocked` Task (default 500ms), so a one-frame transition is never reported. */
+  confirmDelayMs?: number;
 }
 
 const WAIT_TYPES = ["worker_done", "question", "escalation"];
+/** Orca `blocked` is a Task status, not an outcome: it never ends the wait and never authorizes a retry (only `worker_done` is authoritative). */
+const TASK_BLOCKED_GUIDANCE = "Orca reports the Task as blocked; this is NOT terminal and the Dispatch may still be alive: a worker_done may still arrive "
+  + "(a worker reported blocked at an intermediate stage has later sent heartbeats and a succeeded worker_done). Keep polling with the same identities; "
+  + "stop, abandon or retry only on positive evidence that the worker has exited (liveness from `orca orchestration worker-list --run <run>`), never on this status alone.";
 const MAX_BATCHES = 50;
 const TEXT_MAX = 4000;
 const LIST_MAX = 100;
@@ -170,7 +176,7 @@ class OrcaCallError extends Error {
 
 export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" | "orcaTimeoutMs">,
   identity: OrcaWaitIdentity, options: OrcaWaitOptions, process: OrcaProcess = runOrcaProcess,
-  now: () => number = Date.now): Promise<Record<string, unknown>> {
+  now: () => number = Date.now, sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms))): Promise<Record<string, unknown>> {
   const { runId, taskId, dispatchId, coordinatorHandle } = identity;
   const deadline = now() + options.maxWaitMs;
   const nextPoll = Math.max(1, Math.ceil(options.pollMs / 1000));
@@ -206,11 +212,24 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   const ackFailures: { delivery_id: string; error: string }[] = [];
   const conflicts: string[] = [];
   const pending: Record<string, unknown>[] = [];
+  const rejectedWorkerDone = new Set<string>();
   let ignored = 0;
   let matched: { message: Record<string, any>; payload: Record<string, any>; deliveryId?: string; recovered?: boolean } | undefined;
   let blocked: Record<string, unknown> | undefined;
-  // True once a consuming check reported an empty mailbox (no delivery left), so history can only hold already-ACKed rows.
+  // True once a consuming check reported an empty mailbox (no delivery left). This is a point-in-time observation: a worker_done may land
+  // afterwards, so for a history-recovered verdict it is necessary but not sufficient (see `historyReadGap`).
   let drained = false;
+  // Read-state proof for a worker_done recovered from history. The `read` flag travels in the same `check --all` snapshot that surfaced the
+  // message and is monotonic, so unlike `drained` it leaves no window between "observed" and "closed". Set by any history worker_done for the
+  // awaited Task/Dispatch whose row is not provably read; `unread` (explicit 0/false) outranks `unproven` (absent or malformed).
+  let historyReadGap: "worker_done_unread" | "worker_done_read_unproven" | undefined;
+
+  // Same predicate as the backlog cleanup (`orcaCoordinatorBacklog`): only an explicit 1/true proves the row was consumed.
+  const noteHistoryRead = (message: Record<string, any>): void => {
+    if (message.read === 1 || message.read === true) return;
+    if (message.read === 0 || message.read === false) historyReadGap = "worker_done_unread";
+    else historyReadGap ??= "worker_done_read_unproven";
+  };
 
   const consider = (raw: unknown, deliveryId: string | undefined): void => {
     const message = object(raw);
@@ -219,11 +238,20 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     if (message.type === "worker_done" && payload) {
       const taskOk = payload.taskId === taskId, dispatchOk = payload.dispatchId === dispatchId;
       if (taskOk && dispatchOk) {
+        // Orca can retain the requested outcome on a rejected lifecycle report. The marker's
+        // presence (even if malformed) means this is not an accepted worker completion.
+        if (Object.hasOwn(payload, "_orcaLifecycleRejection")) {
+          rejectedWorkerDone.add(message.id);
+          return;
+        }
         if (payload.outcome !== "succeeded" && payload.outcome !== "failed") {
           conflicts.push(`worker_done ${clip(message.id, 80) ?? ""} for the awaited Task/Dispatch lacks an explicit succeeded|failed outcome`);
-        } else if (matched && object(matched.payload).outcome !== payload.outcome) {
-          conflicts.push("multiple worker_done messages for the awaited Dispatch disagree on outcome");
-        } else if (!matched) matched = { message, payload, deliveryId };
+        } else {
+          if (deliveryId === undefined) noteHistoryRead(message);
+          if (matched && object(matched.payload).outcome !== payload.outcome) {
+            conflicts.push("multiple worker_done messages for the awaited Dispatch disagree on outcome");
+          } else if (!matched) matched = { message, payload, deliveryId };
+        }
       } else if (taskOk || dispatchOk) {
         conflicts.push(`worker_done ${clip(message.id, 80) ?? ""} matches only the ${taskOk ? "Task" : "Dispatch"}; ignored`);
       } else ignored++;
@@ -318,46 +346,90 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   let waiting = false;
   let attention = false;
   let crossError: string | undefined;
-  try {
-    const shown = await quick(["orchestration", "worker-show", "--dispatch", dispatchId]);
-    const projection = object(shown.projection), dispatch = object(shown.dispatch), w = object(shown.worker);
-    if (projection.dispatchId !== undefined && projection.dispatchId !== dispatchId || dispatch.id !== undefined && dispatch.id !== dispatchId
-      || dispatch.taskId !== undefined && dispatch.taskId !== taskId || dispatch.runId !== undefined && dispatch.runId !== runId) {
-      throw new OrcaCallError("worker-show returned a different Run/Task/Dispatch than expected", "identity_mismatch");
+  let crossErrorCode: string | undefined;
+  // True only when the Dispatch and the Task row both state, and match, the awaited Run/Task/Dispatch identity (absence is not a match).
+  let identityProven = false;
+  const crossCheck = async (): Promise<void> => {
+    worker = undefined; launch = {}; taskStatus = undefined; assignee = undefined; waiting = false; attention = false; crossError = undefined; crossErrorCode = undefined; identityProven = false;
+    try {
+      const shown = await quick(["orchestration", "worker-show", "--dispatch", dispatchId]);
+      const projection = object(shown.projection), dispatch = object(shown.dispatch), w = object(shown.worker);
+      if (projection.dispatchId !== undefined && projection.dispatchId !== dispatchId
+        || projection.runId !== undefined && projection.runId !== runId || projection.taskId !== undefined && projection.taskId !== taskId
+        || w.dispatchId !== undefined && w.dispatchId !== dispatchId || dispatch.id !== undefined && dispatch.id !== dispatchId
+        || dispatch.taskId !== undefined && dispatch.taskId !== taskId || dispatch.runId !== undefined && dispatch.runId !== runId) {
+        throw new OrcaCallError("worker-show returned a different Run/Task/Dispatch than expected", "identity_mismatch");
+      }
+      const dispatchProven = dispatch.id === dispatchId && dispatch.taskId === taskId && dispatch.runId === runId;
+      launch = object(object(w.startOptions).launch);
+      assignee = typeof w.agentTerminalHandle === "string" ? w.agentTerminalHandle : undefined;
+      waiting = object(shown.observation).agentWait != null;
+      attention = object(projection.attention).requiresAction === true;
+      worker = { state: clip(w.state, 80), stage: clip(object(projection.stage).detail ?? w.stage, 80), dispatch_status: clip(dispatch.status, 80),
+        outcome: clip(projection.outcome, 80), liveness: clip(object(projection.liveness).verdict, 80),
+        ...(waiting ? { waiting_for_human: true } : {}) };
+      const listed = await quick(["orchestration", "task-list", "--run", runId]);
+      const task = (Array.isArray(listed.tasks) ? listed.tasks : []).map(object).find((t) => t.id === taskId);
+      if (task) {
+        if (task.run_id !== undefined && task.run_id !== runId) throw new OrcaCallError("task-list returned a different Run", "identity_mismatch");
+        taskStatus = clip(task.status, 40);
+        identityProven = dispatchProven && task.run_id === runId;
+      }
+    } catch (error) {
+      crossError = clip(error instanceof Error ? error.message : "cross-check failed", 300);
+      crossErrorCode = error instanceof OrcaCallError ? error.code : undefined;
     }
-    launch = object(object(w.startOptions).launch);
-    assignee = typeof w.agentTerminalHandle === "string" ? w.agentTerminalHandle : undefined;
-    waiting = object(shown.observation).agentWait != null;
-    attention = object(projection.attention).requiresAction === true;
-    worker = { state: clip(w.state, 80), stage: clip(object(projection.stage).detail, 80), dispatch_status: clip(dispatch.status, 80),
-      outcome: clip(projection.outcome, 80), liveness: clip(object(projection.liveness).verdict, 80),
-      ...(waiting ? { waiting_for_human: true } : {}) };
-    const listed = await quick(["orchestration", "task-list", "--run", runId]);
-    const task = (Array.isArray(listed.tasks) ? listed.tasks : []).map(object).find((t) => t.id === taskId);
-    if (task) {
-      if (task.run_id !== undefined && task.run_id !== runId) throw new OrcaCallError("task-list returned a different Run", "identity_mismatch");
-      taskStatus = clip(task.status, 40);
-    }
-  } catch (error) { crossError = clip(error instanceof Error ? error.message : "cross-check failed", 300); }
+  };
 
   // A prior poll may already have consumed and acked the worker_done. `check --all` is a
   // documented read-only history view (no read marking, no ack), so recover the exact message.
   // Task/Dispatch/pending state above is evidence only and never gates this recovery.
+  // Sticky: a later (confirmation) history read can add a schema error but never erase one from an earlier read.
   let historyError: { code: string; message: string | undefined } | undefined;
-  if (!matched) {
+  // Transient failure of the LATEST history read (Orca unavailable, timeout, ordinary Orca error): disclosed, never read as an empty mailbox.
+  // Unlike a schema error it does not make the result unknown, and a later clean read supersedes it.
+  let historyUnavailable: { code: string; message: string | undefined } | undefined;
+  // History rows already weighed, so a second pass over the same mailbox neither double-counts nor re-reports them.
+  const historySeen = new Set<string>();
+  const recoverHistory = async (): Promise<void> => {
+    historyUnavailable = undefined;
     try {
       const history = await quick(["orchestration", "check", "--terminal", coordinatorHandle, "--all"]);
       if (history.runId !== runId) throw new OrcaCallError("Orca history returned a different Run than the launch receipt", "run_mismatch");
       for (const raw of messageList(history).slice(0, HISTORY_MAX)) {
-        if (object(raw).type === "worker_done") consider(raw, undefined);
+        const row = object(raw);
+        if (row.type !== "worker_done") continue;
+        const rowId = typeof row.id === "string" ? row.id : undefined;
+        if (rowId !== undefined) { if (historySeen.has(rowId)) continue; historySeen.add(rowId); }
+        consider(raw, undefined);
       }
       if (matched) matched = { ...(matched as object), recovered: true } as typeof matched;
     } catch (error) {
-      // Unavailable history is best-effort; a response violating the required schema is explicit unknown evidence.
+      // Unavailable history is best-effort (disclosed below); a response violating the required schema is explicit unknown evidence.
       if (error instanceof OrcaCallError && ["run_mismatch", "malformed_result", "malformed_json", "consumer_fenced"].includes(error.code)) {
         historyError = { code: error.code, message: clip(error.message, 300) };
+      } else {
+        historyUnavailable = { code: error instanceof OrcaCallError ? error.code : "orca_unavailable", message: clip(error instanceof Error ? error.message : "history unavailable", 300) };
       }
     }
+  };
+
+  await crossCheck();
+  if (!matched) await recoverHistory();
+  // Orca marks a Task `blocked` for states it also shows as Failed in the IDE (e.g. a worker whose turn start was never observed after its
+  // coordinator terminal died). That is NOT terminal: such a worker can still heartbeat and later deliver a succeeded worker_done, so only the
+  // worker_done (or an Orca-settled Task, reported as unknown) ever ends the wait. One reading is not trusted: it is re-read after a short
+  // pause together with the mailbox history, so a one-frame transition or a worker_done that lands meanwhile wins over the blocked reading.
+  // Both readings must prove the same Run/Task/Dispatch (and Dispatch assignee) and the history must be schema-clean; otherwise the result is unknown.
+  let blockedUnconfirmed = false;
+  if (!matched && taskStatus === "blocked" && identityProven && !crossError && !historyError) {
+    const firstAssignee = assignee;
+    await sleep(options.confirmDelayMs ?? 500);
+    await crossCheck();
+    if (crossError) blockedUnconfirmed = true;
+    else if (!identityProven) conflicts.push("Orca Task/Dispatch identity could not be proven again on the confirmation read; not treating the blocked reading as a verdict");
+    else if (assignee !== firstAssignee) conflicts.push("Orca Dispatch assignee changed between the blocked reading and its confirmation; not treating it as a verdict");
+    if (!matched) await recoverHistory();
   }
 
   const requested = object(launch.requested), effective = object(launch.effective);
@@ -365,7 +437,8 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
     ...(requested.agent !== undefined ? { requested: { agent: clip(requested.agent, 80), model: clip(requested.model, 120), effort: clip(requested.effort, 40) } } : {}),
     ...(effective.agent !== undefined ? { effective: { agent: clip(effective.agent, 80), model: clip(effective.model, 120), effort: clip(effective.effort, 40) } } : {}),
   };
-  const common = { ...base, ...launchInfo, ...(worker ? { worker } : {}), ...(ack ? { ack } : {}), ...(ackFailures.length ? { ack_failures: ackFailures } : {}), ...(ignored ? { ignored_messages: ignored } : {}) };
+  const common = { ...base, ...launchInfo, ...(worker ? { worker } : {}), ...(ack ? { ack } : {}), ...(ackFailures.length ? { ack_failures: ackFailures } : {}), ...(ignored ? { ignored_messages: ignored } : {}),
+    ...(rejectedWorkerDone.size ? { rejected_worker_done: [...rejectedWorkerDone].slice(0, LIST_MAX).map(id => ({ message_id: clip(id, 80) })) } : {}) };
 
   if (matched) {
     const outcome = matched.payload.outcome as "succeeded" | "failed";
@@ -380,7 +453,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       ? matched.payload.filesModified.filter((f: unknown) => typeof f === "string").slice(0, LIST_MAX).map((f: string) => clip(f, 500)).filter(Boolean) : undefined;
     const reportPath = await safeReportPath(matched.payload.reportPath, options.workspace);
     // Supporting lifecycle work after the verdict is fixed: only a verdict backed by an exactly ACKed delivery (or by a
-    // fully drained mailbox, for history recovery) with no conflicting evidence may close the coordinator terminal.
+    // fully drained mailbox plus a history row that itself says `read`, for history recovery) with no conflicting evidence may close the coordinator terminal.
     // Fail closed on identity: the worker-show/task-list cross-check must have succeeded and established a well-formed
     // Dispatch assignee, which is the only proof that the coordinator handle is not the worker terminal.
     let coordinatorCleanup: CoordinatorCleanupResult | { status: "skipped"; coordinator_handle: string; reason: string } | undefined;
@@ -392,7 +465,7 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
         : assignee === coordinatorHandle ? "handle_is_worker_terminal"
         : crossStatus !== "consistent" ? "cross_check_unavailable"
         : !assignee || !ORCA_HANDLE.test(assignee) ? "assignee_unverified"
-        : matched.recovered ? (drained ? undefined : "mailbox_not_drained")
+        : matched.recovered ? (!drained ? "mailbox_not_drained" : historyReadGap)
         : matched.deliveryId && ack?.status === "acknowledged" && ack.delivery_id === matched.deliveryId ? undefined : "ack_not_confirmed";
       coordinatorCleanup = reason ? { status: "skipped", coordinator_handle: coordinatorHandle, reason }
         : await closeCoordinatorTerminal(config, { runId, coordinatorHandle, workerHandles: assignee ? [assignee] : [] }, process, cwd);
@@ -408,13 +481,33 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
       ...(coordinatorCleanup ? { coordinator_cleanup: coordinatorCleanup } : {}) };
   }
 
+  // A Dispatch/Task that contradicts the awaited identity is evidence of a wrong binding, not of a quiet worker: unknown, never running.
+  if (crossErrorCode === "identity_mismatch") conflicts.push("Orca Run/Task/Dispatch identity contradicted the awaited identity; the Task/Dispatch state is not usable evidence");
   const settled = taskStatus === "completed" || taskStatus === "failed";
   if (settled) conflicts.push(`Orca Task is ${taskStatus} but no matching worker_done was observed (it may have been consumed earlier); outcome is not authoritative`);
-  const state = settled || conflicts.length || historyError ? "unknown" : blocked || waiting || attention ? "blocked" : "running";
+  // Public lifecycle observations are supporting evidence, never a substitute for worker_done.
+  // Report the gap explicitly rather than describing an observed failed/exited worker as progressing.
+  const observed = object(worker);
+  const missingCompletion = identityProven && !crossError && (settled || observed.state === "failed"
+    || observed.dispatch_status === "failed" || observed.stage === "process_exited" || observed.liveness === "exited");
+  const completionError = rejectedWorkerDone.size ? { code: "worker_done_rejected",
+    message: "UNVERIFIED: Orca rejected a matching worker_done; no accepted matching completion was observed. Runtime ownership must resolve the terminal outcome." }
+    : missingCompletion ? { code: "missing_worker_done",
+      message: "UNVERIFIED: Orca reports a failed/exited worker or settled Task, but no accepted matching worker_done was observed. This is not an authoritative worker outcome; the runtime owner must resolve the missing completion." } : undefined;
+  // A blocked verdict needs the Task row and the Dispatch to prove they belong to the awaited Run/Task/Dispatch; otherwise it is unknown, never running.
+  const blockedTask = taskStatus === "blocked" && identityProven && !crossError;
+  if (taskStatus === "blocked" && !identityProven && !crossError) conflicts.push("Orca Task is blocked but its Run/Dispatch identity could not be proven; not treating it as a verdict");
+  if (blockedUnconfirmed) conflicts.push("Orca Task was observed blocked but the confirmation read failed; blocked is unconfirmed");
+  const state = settled || conflicts.length || historyError || completionError ? "unknown" : blocked || waiting || attention || blockedTask ? "blocked" : "running";
   return { ...common, state, awaited_terminal: false, awaited_completed: false, succeeded: false,
-    cross_check: { status: crossError ? "unavailable" : "pending", ...(taskStatus ? { task_status: taskStatus } : {}), ...(crossError ? { error: crossError } : {}) },
+    ...(completionError ? { completion_verification: "unverified" } : {}),
+    ...(missingCompletion ? { missing_completion: true } : {}),
+    ...(state === "blocked" && blockedTask ? { blocked_reason: "task_blocked", blocked_non_terminal: true, blocked_guidance: TASK_BLOCKED_GUIDANCE } : {}),
+    cross_check: { status: crossError ? "unavailable" : state === "blocked" && blockedTask ? "blocked" : "pending", ...(taskStatus ? { task_status: taskStatus } : {}), ...(crossError ? { error: crossError } : {}) },
     ...(pending.length ? { pending_messages: pending.slice(0, 10) } : {}),
     ...(historyError ? { error: historyError, history_check: "failed" } : {}),
+    ...(!historyError && completionError ? { error: completionError } : {}),
+    ...(historyUnavailable ? { history_check: "unavailable", history_unavailable: historyUnavailable } : {}),
     ...(conflicts.length ? { evidence_conflict: [...new Set(conflicts)] } : {}),
     next_poll_after_seconds: nextPoll };
 }
