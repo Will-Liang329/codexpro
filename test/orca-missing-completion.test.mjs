@@ -73,7 +73,9 @@ test('a live/start_unknown Task blocked and a normal wait timeout remain non-ter
 for (const status of ['failed', 'completed']) {
   test(`settled Task ${status} alone never substitutes for missing worker_done`, async () => {
     const m = mock({ shown: live(), status }); const r = await wait(m); noAuthority(r);
-    assert.equal(r.error.code, 'missing_worker_done'); noClose(m);
+    assert.equal(r.error, undefined); assert.equal(r.missing_completion, undefined);
+    assert.equal(r.completion_verification, undefined);
+    assert.match(r.evidence_conflict.join(' '), /no matching worker_done/); noClose(m);
   });
 }
 
@@ -152,4 +154,89 @@ test('wrong projection/worker identity never produces a supported missing-comple
     const m = mock({ shown, status: 'dispatched' }); const r = await wait(m); noAuthority(r); noClose(m);
     assert.equal(r.missing_completion, undefined); assert.match(r.evidence_conflict.join(' '), /identity/);
   }
+});
+
+
+test('live worker with agent_prompt_stalled dispatch failure remains pending without missing completion', async () => {
+  for (const status of ['dispatched', 'blocked']) {
+    const shown = live();
+    shown.dispatch.status = 'failed';
+    shown.dispatch.lastFailure = 'agent_prompt_stalled';
+    shown.worker.state = 'failed';
+    shown.projection.attention.requiresAction = true;
+    const m = mock({ shown, status }); const r = await wait(m);
+    assert.equal(r.state, 'blocked');
+    assert.equal(r.worker.liveness, 'live');
+    assert.equal(r.worker.dispatch_status, 'failed');
+    assert.equal(r.missing_completion, undefined);
+    assert.equal(r.completion_verification, undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(r.awaited_terminal, false); assert.equal(r.succeeded, false); noClose(m);
+  }
+});
+
+
+test('failed statuses without positive exit evidence never imply missing completion', async () => {
+  for (const verdict of [undefined, 'unverifiable', 'live']) {
+    const shown = live();
+    shown.dispatch.status = 'failed'; shown.dispatch.lastFailure = 'agent_prompt_stalled';
+    shown.worker.state = 'failed'; shown.projection.liveness = verdict ? { verdict } : {};
+    const m = mock({ shown, status: 'dispatched' }); const r = await wait(m);
+    assert.equal(r.state, 'running'); assert.equal(r.error, undefined);
+    assert.equal(r.missing_completion, undefined); assert.equal(r.awaited_terminal, false); noClose(m);
+  }
+});
+
+test('positive exit evidence without failed statuses still reports unverified missing completion', async () => {
+  for (const evidence of ['stage', 'liveness']) {
+    const shown = live();
+    if (evidence === 'stage') {
+      shown.projection.stage.detail = 'process_exited'; shown.projection.liveness = {};
+    } else shown.projection.liveness.verdict = 'exited';
+    const m = mock({ shown, status: 'dispatched' }); const r = await wait(m);
+    noAuthority(r); noClose(m); assert.equal(r.error.code, 'missing_worker_done');
+    assert.equal(r.missing_completion, true); assert.equal(r.completion_verification, 'unverified');
+  }
+});
+
+test('explicit live liveness prevents a stale process_exited stage from claiming missing completion', async () => {
+  const shown = exited(); shown.projection.liveness.verdict = 'live';
+  const m = mock({ shown, status: 'dispatched' }); const r = await wait(m);
+  assert.equal(r.state, 'blocked'); assert.equal(r.error, undefined);
+  assert.equal(r.missing_completion, undefined); assert.equal(r.awaited_terminal, false); noClose(m);
+});
+
+test('a genuine late worker_done remains authoritative after a live failed dispatch poll', async () => {
+  for (const outcome of ['succeeded', 'failed']) {
+    const shown = live(); shown.dispatch.status = 'failed'; shown.dispatch.lastFailure = 'agent_prompt_stalled';
+    const pending = mock({ shown, status: 'blocked' }); const first = await wait(pending);
+    assert.equal(first.state, 'blocked'); assert.equal(first.missing_completion, undefined); noClose(pending);
+    shown.dispatch.status = outcome === 'succeeded' ? 'completed' : 'failed';
+    shown.projection.outcome = outcome;
+    const late = mock({ shown, status: shown.dispatch.status, batches: [[done(outcome)]] });
+    const r = await wait(late);
+    assert.equal(r.state, outcome === 'succeeded' ? 'completed' : 'failed');
+    assert.equal(r.awaited_terminal, true); assert.equal(r.outcome, outcome);
+    assert.equal(r.worker_done.message_id, 'msg-done'); assert.equal(r.error, undefined);
+    assert.equal(r.ack.status, 'acknowledged'); assert.equal(r.ack.delivery_id, 'delivery-1');
+    assert.equal(r.coordinator_cleanup.status, 'closed');
+  }
+});
+
+test('a late accepted report arriving during rejection ACK wins through history without premature cleanup', async () => {
+  const shown = live(); shown.dispatch.status = 'failed'; shown.dispatch.lastFailure = 'agent_prompt_stalled';
+  const history = [rejected()];
+  const m = mock({ shown, status: 'blocked', history, batches: [[rejected()]] });
+  const process = async (binary, args) => {
+    const response = await m.process(binary, args);
+    if (args.includes('--ack')) history.push(done());
+    return response;
+  };
+  const r = await waitForOrca(config, id, opts, process, () => 0, async () => {});
+  assert.equal(r.state, 'completed'); assert.equal(r.outcome, 'succeeded');
+  assert.equal(r.worker_done.message_id, 'msg-done'); assert.equal(r.worker_done.recovered_from_history, true);
+  assert.equal(r.error, undefined); assert.equal(r.missing_completion, undefined);
+  assert.deepEqual(r.rejected_worker_done, [{ message_id: 'msg-rejected' }]);
+  assert.equal(r.ack.status, 'acknowledged'); assert.equal(r.ack.delivery_id, 'delivery-1');
+  assert.equal(m.calls.filter(a => a.includes('--ack')).length, 1); noClose(m);
 });
