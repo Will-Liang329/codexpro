@@ -486,14 +486,16 @@ export async function waitForOrca(config: Pick<CodexProConfig, "orcaExecutable" 
   const settled = taskStatus === "completed" || taskStatus === "failed";
   if (settled) conflicts.push(`Orca Task is ${taskStatus} but no matching worker_done was observed (it may have been consumed earlier); outcome is not authoritative`);
   // Public lifecycle observations are supporting evidence, never a substitute for worker_done.
-  // Report the gap explicitly rather than describing an observed failed/exited worker as progressing.
+  // Failed worker/Dispatch status can coexist with a live agent (e.g. agent_prompt_stalled).
+  // Only positive process-exit evidence supports missing completion; an explicit live verdict
+  // keeps even a stale process_exited stage from prematurely ending the normal wait classification.
   const observed = object(worker);
-  const missingCompletion = identityProven && !crossError && (settled || observed.state === "failed"
-    || observed.dispatch_status === "failed" || observed.stage === "process_exited" || observed.liveness === "exited");
+  const missingCompletion = identityProven && !crossError && (observed.liveness === "exited"
+    || observed.stage === "process_exited" && observed.liveness !== "live");
   const completionError = rejectedWorkerDone.size ? { code: "worker_done_rejected",
     message: "UNVERIFIED: Orca rejected a matching worker_done; no accepted matching completion was observed. Runtime ownership must resolve the terminal outcome." }
     : missingCompletion ? { code: "missing_worker_done",
-      message: "UNVERIFIED: Orca reports a failed/exited worker or settled Task, but no accepted matching worker_done was observed. This is not an authoritative worker outcome; the runtime owner must resolve the missing completion." } : undefined;
+      message: "UNVERIFIED: Orca reports process exit, but no accepted matching worker_done was observed. This is not an authoritative worker outcome; the runtime owner must resolve the missing completion." } : undefined;
   // A blocked verdict needs the Task row and the Dispatch to prove they belong to the awaited Run/Task/Dispatch; otherwise it is unknown, never running.
   const blockedTask = taskStatus === "blocked" && identityProven && !crossError;
   if (taskStatus === "blocked" && !identityProven && !crossError) conflicts.push("Orca Task is blocked but its Run/Dispatch identity could not be proven; not treating it as a verdict");
