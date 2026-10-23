@@ -1734,7 +1734,11 @@ async function main(): Promise<void> {
     jsonError(res, 405, "method_not_allowed", "Use GET or POST for /admin/profile.");
   });
 
-  app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+  // edit carries old and new text; JSON can escape each UTF-8 byte as six bytes.
+  // Keep the historical ceiling for larger configurations and bound all RPC metadata too.
+  const mcpBodyLimit = Math.min(20 * 1024 * 1024,
+    6 * (Math.max(config.maxReadBytes, config.maxWriteBytes) + config.maxWriteBytes) + 64 * 1024);
+  app.post("/mcp", express.json({ limit: mcpBodyLimit }), async (req, res) => {
     connectionDiagnostics.mcp_dispatches_started += 1;
     connectionDiagnostics.last_dispatch_started_at = new Date().toISOString();
     try {
