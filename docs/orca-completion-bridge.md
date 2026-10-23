@@ -19,6 +19,11 @@ Completion authority is intentionally narrow:
 
 The bridge can return `running`, `blocked`, `completed`, `failed`, or `unknown`.
 
+An explicit `.mjs` path in `CODEXPRO_ORCA_BINARY` (or cleanup's `--orca-binary`)
+is launched with the current Node executable, including on Windows where Unix
+shebangs cannot be executed directly. Native executables are invoked unchanged.
+Arguments remain literal argv values; no shell is involved.
+
 ## Launch and wait workflow
 
 ### 1. Launch normally

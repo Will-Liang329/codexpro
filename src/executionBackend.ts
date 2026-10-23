@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { orcaCommand } from "./orcaCommand.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
@@ -17,7 +18,8 @@ export interface CliOutput { exitCode: number; stdout: string; stderr: string }
 export type OrcaProcess = (binary: string, args: string[], cwd: string, timeoutMs: number) => Promise<CliOutput>;
 
 export const runOrcaProcess: OrcaProcess = (binary, args, cwd, timeoutMs) => new Promise((resolve, reject) => {
-  execFile(binary, args, { cwd, timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, encoding: "utf8" },
+  const [command, commandArgs] = orcaCommand(binary, args, cwd);
+  execFile(command, commandArgs, { cwd, timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, encoding: "utf8" },
     (error, stdout, stderr) => {
       if (error && typeof error.code !== "number") {
         // Never include argv, provider output, or environment in diagnostics.
