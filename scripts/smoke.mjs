@@ -1143,7 +1143,7 @@ const agentHandoff = await client.request('tools/call', {
     plan: '- Verify demo.txt contains write.'
   }
 });
-if (agentHandoff.structuredContent.agent !== 'opencode') throw new Error('handoff_to_agent did not preserve target agent');
+if (agentHandoff.structuredContent.agent !== 'opencode') throw new Error(`handoff_to_agent did not preserve target agent: ${JSON.stringify(agentHandoff)}`);
 if (Object.hasOwn(agentHandoff.structuredContent, 'reasoning_effort')) {
   throw new Error('handoff_to_agent did not preserve optional reasoning_effort compatibility');
 }

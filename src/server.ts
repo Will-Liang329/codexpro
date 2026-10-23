@@ -56,12 +56,17 @@ async function orcaWaitResult(config: CodexProConfig, workspace: Workspace, args
   const lines = [`# Wait For Handoff (Orca)`, "", `State: ${result.state}${result.outcome ? ` (outcome ${result.outcome})` : ""}`,
     `Run: ${result.runId}; Task: ${result.taskId}; Dispatch: ${result.dispatchId}`,
     ...(result.summary ? ["", String(result.summary)] : []),
+    ...(result.blocked_reason ? ["", `Blocked (${result.blocked_reason}): ${result.blocked_guidance}`] : []),
     ...(result.evidence_conflict ? ["", `Evidence conflict: ${(result.evidence_conflict as string[]).join("; ")}`] : []),
     ...(result.error ? ["", `Error: ${(result.error as any).message}`] : []),
     ...(result.next_poll_after_seconds ? ["", `Re-poll after ~${result.next_poll_after_seconds}s.`] : [])];
   return { ...textResult(lines.join("\n"), { workspace_id: workspace.id, root: workspace.root, ...result }), ...(result.error ? { isError: true } : {}) };
 }
 
+// Explicit tools use flat scalar arguments; export_pro_context includes at most
+// 80 files and session filters allow 12 roles / 40 tool names. Leave room for
+// path/glob selections and the supertool envelope, but bound validation work.
+const MAX_TOOL_INPUT_ELEMENTS = 1024;
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
 function errorText(error: unknown): string {
@@ -1063,7 +1068,10 @@ export function createCodexProServer(
   const workspaces = new WorkspaceManager(config, options.workspaceRegistry);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
-  const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, {
+    instructions: serverInstructions(config),
+    maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS
+  });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 

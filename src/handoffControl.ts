@@ -28,7 +28,7 @@ async function identity(root: string): Promise<{ common: string; entries: string
   const common = await fs.realpath(path.resolve(root,
     git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")));
   const entries = git(root, "worktree", "list", "--porcelain", "-z").split("\0")
-    .filter(value => value.startsWith("worktree ")).map(value => value.slice(9));
+    .filter(value => value.startsWith("worktree ")).map(value => path.normalize(value.slice(9)));
   if (!entries.includes(root)) throw new CodexProError("Selected worktree is no longer linked to its Git repository.");
   return { common, entries };
 }
