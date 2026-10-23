@@ -82,6 +82,25 @@ room for these fields and wrapper metadata while bounding validation work on the
 otherwise open-ended record/array schemas. Split larger path/glob selections
 across calls. This is an aggregate input budget, not a limit on result sizes.
 
+### HTTP envelope
+
+The `/mcp` JSON parser also limits the entire decompressed request to
+`min(20 * 1024 * 1024, 6 * (max(maxReadBytes, maxWriteBytes) + maxWriteBytes) + 64 * 1024)`
+bytes. With the default budgets this is 12,065,536 bytes, below the previous
+20 MiB parser limit. The factor of six allows JSON escaping of both the existing
+text and its replacement; 64 KiB accommodates paths, RPC fields and metadata.
+Larger configured file budgets retain the historical 20 MiB ceiling rather than
+increasing the server's exposure. Authentication runs before body parsing.
+
+This is an aggregate envelope, including unknown fields and JSON whitespace,
+not a promise that every combination of individually valid fields fits. Calls
+above it return HTTP 413 before tool execution, including chunked bodies and
+compressed requests whose decompressed body exceeds the budget. Large bash,
+patch, metadata or heavily escaped calls must fit this envelope; split work
+across calls when necessary. The 1,024-element validation budget independently
+bounds nested object/array validation. Neither gate changes an already running
+service until that service is explicitly upgraded.
+
 ## Safer Defaults
 
 Default daily mode:

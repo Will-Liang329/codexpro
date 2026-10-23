@@ -33,11 +33,8 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build
-        run: npm run build
-
-      - name: Smoke Test
-        run: npm run smoke
+      - name: Build, Smoke and Regression Tests
+        run: npm run check
 
       - name: Stress Test
         run: npm run stress
