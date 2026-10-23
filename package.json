@@ -70,7 +70,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "npm run build && npm run smoke && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs test/orca-coordinator-cleanup.test.mjs test/orca-wait-blocked.test.mjs test/orca-wait-unread-cleanup.test.mjs test/orca-missing-completion.test.mjs",
+    "check": "npm run build && npm run smoke && node --test test/execution-backend.test.mjs test/orca-completion.test.mjs test/orca-coordinator-cleanup.test.mjs test/orca-wait-blocked.test.mjs test/orca-wait-unread-cleanup.test.mjs test/orca-missing-completion.test.mjs test/mcp-resource-limits.test.mjs",
     "prepack": "npm run build",
     "prepublishOnly": "node scripts/release-guard.mjs",
     "start": "node dist/stdio.js",
@@ -103,7 +103,7 @@
     "smoke:orca": "npm run build && node scripts/orca-integration-smoke.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "chardet": "^2.2.0",
     "express": "^5.1.0",
     "iconv-lite": "^0.7.3",

@@ -66,6 +66,22 @@ The main risks are:
 - leaking a `codexpro_token` or Cloudflare tunnel token
 - trusting a downloaded `cloudflared` binary without understanding where it came from
 
+## MCP Input Resource Limits
+
+Every tool call is limited to 1,024 total object members and array elements,
+including nested values, unknown fields, and the `codexpro` wrapper. The SDK
+checks this budget before Zod validation and before invoking the tool handler;
+excessive input returns an `isError: true` tool result. This applies to HTTP and
+stdio servers. String bytes are not counted as elements.
+
+The explicit tool schemas mostly accept flat scalar fields. The largest intended
+collection is `export_pro_context`, which includes at most 80 files; a wrapped
+call with 80 selected paths and 80 extra globs fits comfortably. Session search
+filters accept at most 12 roles and 40 tool names. The 1,024-element budget leaves
+room for these fields and wrapper metadata while bounding validation work on the
+otherwise open-ended record/array schemas. Split larger path/glob selections
+across calls. This is an aggregate input budget, not a limit on result sizes.
+
 ## Safer Defaults
 
 Default daily mode:
