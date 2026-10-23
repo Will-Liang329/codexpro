@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Normalize Git worktree path separators for Windows handoff identity checks and run explicit `.mjs` Orca CLI adapters through Node, preserving literal arguments and the existing identity gates.
+
 - Bound MCP tool inputs to 1,024 aggregate elements and HTTP JSON bodies to the configured read/write envelope (12,065,536 bytes by default, at most the existing 20 MiB ceiling). Oversized bodies return HTTP 413 before tool dispatch, including chunked and decompressed requests. Updated the MCP SDK, Hono and ip-address security dependencies; CI now runs the completion and resource-limit regression tests on every matrix entry.
 
 - Added operator-only `--allow-unread-worker-done` to `npm run orca:cleanup-coordinators` for the one-time historical backlog: it waives only the `worker_done_unread` exclusion (a matching unread `worker_done` becomes sufficient evidence) while every other safety proof stays mandatory. Default behavior still excludes unread `worker_done`, and live `wait_for_handoff` cleanup eligibility is unchanged.
