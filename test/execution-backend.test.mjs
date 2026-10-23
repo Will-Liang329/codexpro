@@ -116,6 +116,9 @@ test('subprocess uses literal argv, isolates stderr and propagates exit/timeout'
     const out = await runOrcaProcess(process.execPath, [script, '$(touch unsafe)', 'a b'], dir, 1000);
     assert.equal(out.exitCode, 7); assert.equal(out.stderr, 'noise');
     assert.deepEqual(JSON.parse(out.stdout), ['$(touch unsafe)', 'a b']);
+    const scriptOut = await runOrcaProcess(script, ['$(touch unsafe)', 'a b'], dir, 1000);
+    assert.equal(scriptOut.exitCode, 7);
+    assert.deepEqual(JSON.parse(scriptOut.stdout), ['$(touch unsafe)', 'a b']);
     assert.deepEqual(await fs.readdir(dir), ['fake.mjs']);
     await fs.writeFile(script, 'setInterval(()=>{},1000);');
     await assert.rejects(runOrcaProcess(process.execPath, [script], dir, 30), /timeout_or_signal/);

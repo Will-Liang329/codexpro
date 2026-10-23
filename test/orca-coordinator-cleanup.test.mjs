@@ -86,7 +86,7 @@ test('cleanup: a failed (terminal) worker_done also closes the coordinator', asy
 });
 
 test('cleanup: completion recovered from already-ACKed history closes the coordinator', async () => {
-  const m = mock({ history: [noise(1), done()] });
+  const m = mock({ history: [noise(1), done({}, { read: 1 })] });
   const r = await run(m);
   assert.equal(r.state, 'completed'); assert.equal(r.worker_done.recovered_from_history, true);
   assert.equal(r.coordinator_cleanup.status, 'closed'); assert.equal(closes(m).length, 1);
@@ -94,7 +94,7 @@ test('cleanup: completion recovered from already-ACKed history closes the coordi
 });
 
 test('cleanup: repeat wait after the coordinator is gone stays completed and treats a stale close as already_gone', async () => {
-  const m = mock({ history: [done()], close: fail('terminal_handle_stale', 'Terminal handle is stale') });
+  const m = mock({ history: [done({}, { read: 1 })], close: fail('terminal_handle_stale', 'Terminal handle is stale') });
   const r = await run(m);
   assert.equal(r.state, 'completed'); assert.equal(r.outcome, 'succeeded'); assert.equal(r.error, undefined);
   assert.equal(r.coordinator_cleanup.status, 'already_gone'); assert.equal(r.coordinator_cleanup.code, 'terminal_handle_stale');
@@ -226,7 +226,7 @@ test('no-close: malformed or conflicting evidence on an otherwise valid verdict'
 });
 
 test('no-close: unavailable or incomplete identity cross-check fails closed but keeps the verdict', async () => {
-  const sources = [['exact ACK', (from) => ({ batches: [delivery('d1', [done({}, { from_handle: from })])] })], ['history recovery', (from) => ({ history: [done({}, { from_handle: from })] })]];
+  const sources = [['exact ACK', (from) => ({ batches: [delivery('d1', [done({}, { from_handle: from })])] })], ['history recovery', (from) => ({ history: [done({}, { from_handle: from, read: 1 })] })]];
   const identityCases = [
     ['worker-show fails', { show: fail('dispatch_not_found', 'no such dispatch') }, 'cross_check_unavailable', 'unavailable'],
     ['worker-show malformed JSON', { show: { exitCode: 0, stdout: 'not json', stderr: '' } }, 'cross_check_unavailable', 'unavailable'],
@@ -262,13 +262,13 @@ test('no-close: pending attributable question in the same delivery, or an undrai
   let r = await run(m);
   assert.equal(r.state, 'completed'); assert.equal(r.coordinator_cleanup.reason, 'pending_question_or_escalation'); assert.equal(closes(m).length, 0);
   // an attributable question that ends the loop early (a later delivery may still be unACKed) while history holds the worker_done
-  m = mock({ batches: [delivery('d1', [attributable])], history: [done()] });
+  m = mock({ batches: [delivery('d1', [attributable])], history: [done({}, { read: 1 })] });
   r = await run(m);
   assert.equal(r.state, 'completed'); assert.equal(r.worker_done.recovered_from_history, true);
   assert.equal(r.coordinator_cleanup.reason, 'pending_question_or_escalation'); assert.equal(closes(m).length, 0);
   // the deadline ends the loop right after a delivery: the mailbox was not observed empty, so history recovery cannot prove ACK
   let t = 0;
-  m = mock({ batches: [delivery('d1', [noise(1)]), delivery('d2', [done()])], history: [done()] });
+  m = mock({ batches: [delivery('d1', [noise(1)]), delivery('d2', [done()])], history: [done({}, { read: 1 })] });
   r = await waitForOrca(config, id, { ...opts, maxWaitMs: 1000 }, m.process, () => (t += 600));
   assert.equal(r.state, 'completed'); assert.equal(r.worker_done.recovered_from_history, true);
   assert.equal(r.coordinator_cleanup.reason, 'mailbox_not_drained'); assert.equal(closes(m).length, 0);

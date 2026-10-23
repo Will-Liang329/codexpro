@@ -3,6 +3,7 @@
 // Dry-run by default (read-only Orca CLI calls). Pass --apply to close the proven-safe candidates,
 // one exact `terminal close --terminal <handle> --tab` each. Never uses `--worktree ... --all`.
 import { execFile } from 'node:child_process';
+import { orcaCommand } from '../dist/orcaCommand.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_COORDINATOR_TITLES, runBacklogCleanup } from '../dist/orcaCoordinatorBacklog.js';
@@ -49,7 +50,8 @@ function cleanEnv(env) {
   return out;
 }
 const cleanProcess = (binary, args, cwd, timeoutMs) => new Promise((resolve, reject) => {
-  execFile(binary, args, { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8', env: cleanEnv(process.env) },
+  const [command, commandArgs] = orcaCommand(binary, args, cwd);
+  execFile(command, commandArgs, { cwd, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8', env: cleanEnv(process.env) },
     (error, stdout, stderr) => {
       if (error && typeof error.code !== 'number') reject(new Error(`Orca process unavailable or interrupted (${error.killed ? 'timeout_or_signal' : error.code ?? 'unknown'})`));
       else resolve({ exitCode: error?.code ?? 0, stdout, stderr });
