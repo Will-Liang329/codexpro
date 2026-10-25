@@ -22,15 +22,17 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { resolveHandoffControl } from "./handoffControl.js";
-import { launchOrca, OrcaLaunchError, waitForOrca } from "./executionBackend.js";
+import { OrcaLaunchError, waitForOrca } from "./executionBackend.js";
+
+import { launchOrcaRecoverable } from "./orcaLaunchRecovery.js";
 
 async function orcaHandoffResult(config: CodexProConfig, workspace: Workspace, args: {
-  plan: string; agent?: string; model?: string; reasoning_effort?: string; title?: string; append?: boolean;
+  plan: string; agent?: string; model?: string; reasoning_effort?: string; title?: string; append?: boolean; request_id?: string;
 }): Promise<any> {
   try {
-    const receipt = await launchOrca(config, { workspace: workspace.root, plan: args.plan,
+    const receipt = await launchOrcaRecoverable(config, { workspace: workspace.root, plan: args.plan,
       agent: args.agent, model: args.model, reasoningEffort: args.reasoning_effort,
-      title: args.title, append: args.append });
+      title: args.title, append: args.append, requestId: args.request_id });
     return textResult(`Orca worker ${receipt.state}. Run: ${receipt.runId}; Task: ${receipt.taskId}; Dispatch: ${receipt.dispatchId}`, receipt);
   } catch (error) {
     if (!(error instanceof OrcaLaunchError)) throw error;
@@ -3134,6 +3136,7 @@ export function createCodexProServer(
       description:
         "Hand off the plan using the configured execution backend. AHR writes handoff files; Orca starts a supervised worker and returns its launch receipt.",
       inputSchema: {
+        request_id: z.string().regex(ORCA_ID).optional().describe("Orca idempotency key. Repeat the identical request to recover; omitted keys are derived from workspace and full launch input. Use a new key only for an intentionally new task."),
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         agent: z.string().optional().describe("Target agent id, for example codex, opencode, pi, or custom. Default: custom."),
         agent_name: z.string().optional().describe("Human-readable agent name for custom agents."),
@@ -3208,6 +3211,7 @@ ${result.prompt}
       title: "Handoff To Codex",
       description: "Compatibility wrapper for handoff_to_agent with agent=codex.",
       inputSchema: {
+        request_id: z.string().regex(ORCA_ID).optional().describe("Orca idempotency key; repeat identical input with the same key to recover its existing launch."),
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         title: z.string().optional().describe("Short task title."),
         plan: z.string().describe("Detailed implementation plan for Codex."),

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Recover ambiguous Orca launches using durable request identities and exact Dispatch inspection. Repeated identical handoffs inspect the existing worker instead of starting duplicates; optional `request_id` supports explicit task identity. See [Orca launch recovery](docs/orca-launch-recovery.md).
+
+## Unreleased
+
 - Normalize Git worktree path separators for Windows handoff identity checks and run explicit `.mjs` Orca CLI adapters through Node, preserving literal arguments and the existing identity gates.
 
 - Bound MCP tool inputs to 1,024 aggregate elements and HTTP JSON bodies to the configured read/write envelope (12,065,536 bytes by default, at most the existing 20 MiB ceiling). Oversized bodies return HTTP 413 before tool dispatch, including chunked and decompressed requests. Updated the MCP SDK, Hono and ip-address security dependencies; CI now runs the completion and resource-limit regression tests on every matrix entry.
