@@ -38,6 +38,11 @@ export async function launchOrcaRecoverable(
     diagnostics: row.diagnostics,
     recovery: { action: "handoff_to_agent", request_id: requestId, guidance: "Repeat the identical handoff with this request_id to inspect; do not create a fresh request." }
   });
+  const syncDirectory = async (directory: string): Promise<void> => {
+    // Fail closed before allocation on filesystems/platforms that cannot provide this durability.
+    const handle = await fs.open(directory, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+  };
   // Atomic replace for checkpoints; only the original exclusive claimant writes.
   const save = async (): Promise<void> => {
     row.updated_at = new Date().toISOString();
@@ -45,6 +50,7 @@ export async function launchOrcaRecoverable(
     const f = await fs.open(temp, "wx", 0o600);
     try { await f.writeFile(JSON.stringify(row)); await f.sync(); } finally { await f.close(); }
     await fs.rename(temp, file);
+    await syncDirectory(dir);
   };
   const read = async (): Promise<Row> => {
     const output = obj(JSON.parse(await fs.readFile(file, "utf8")));
@@ -119,7 +125,15 @@ export async function launchOrcaRecoverable(
     }
   };
   try {
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const firstCreated = await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    if (firstCreated) {
+      // Persist newly created ancestors as well as the leaf; a synced claim is useless if its directory disappears.
+      const parent = path.dirname(path.resolve(firstCreated));
+      for (let current = path.resolve(dir); ; current = path.dirname(current)) {
+        await syncDirectory(current);
+        if (current === parent) break;
+      }
+    }
     let claim;
     try { claim = await fs.open(file, "wx", 0o600); }
     catch (error) {
@@ -127,6 +141,7 @@ export async function launchOrcaRecoverable(
       return await recover();
     }
     try { await claim.writeFile(JSON.stringify(row)); await claim.sync(); } finally { await claim.close(); }
+    await syncDirectory(dir);
     const tracked: OrcaProcess = async (binary, args, cwd, timeout) => {
       const command = args.slice(0, 2).join(" ");
       const mutation = ["terminal create", "orchestration run-create", "orchestration worker-start"].includes(command);

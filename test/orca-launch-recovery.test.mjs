@@ -166,3 +166,55 @@ test('recovered completed worker continues through authoritative worker_done bri
  assert.equal(done.succeeded,true);assert.equal(done.worker_done.message_id,'msg-test');assert.equal(done.awaited_terminal,true);
  }finally{await fs.rm(dir,{recursive:true,force:true});}
 });
+
+test('directory durability failure fences allocation before any Orca call',async()=>{
+ const {dir,m,input,options}=await setup();const original=fs.open;
+ try{
+ let synced=0;
+ fs.open=async function(file,...args){
+  if(file===options.journalDir){synced++;throw Object.assign(new Error('directory sync unavailable'),{code:'EIO'});}
+  return original.call(this,file,...args);
+ };
+ await assert.rejects(launchOrcaRecoverable(config,input,m.process,options),e=>e.receipt.state==='unknown'&&e.receipt.retry_allowed===false);
+ assert.equal(m.starts,0);assert.ok(synced>0);
+ }finally{fs.open=original;await fs.rm(dir,{recursive:true,force:true});}
+});
+test('claim and checkpoint directory entries are synced',async()=>{
+ const {dir,m,input,options}=await setup();const original=fs.open;let syncs=0;
+ try{
+ fs.open=async function(file,...args){const handle=await original.call(this,file,...args);
+ if(file===options.journalDir){const sync=handle.sync.bind(handle);handle.sync=async()=>{syncs++;return sync();};}return handle;};
+ await launchOrcaRecoverable(config,input,m.process,options);
+ // New directory, initial claim, and before/after each of coordinator, Run, worker mutations.
+ assert.ok(syncs>=8);assert.equal(m.starts,1);
+ }finally{fs.open=original;await fs.rm(dir,{recursive:true,force:true});}
+});
+
+test('bounded polling observes worker creation after timeout in same handoff',async()=>{
+ const {dir,m,input,options}=await setup('absent');let reads=0;
+ try{
+ const proc=async(b,args,cwd,t)=>{
+  if(args[1]==='request-show'){
+   const key=args[args.indexOf('--request')+1];
+   if(++reads===2)m.requests.set(key,{method:'orchestration.workerStart',receipt:{runId:'run-test',taskId:'task-test',dispatchId:'ctx-test'}});
+  }
+  return m.process(b,args,cwd,t);
+ };
+ const r=await launchOrcaRecoverable(config,input,proc,{...options,recoveryAttempts:3});
+ assert.equal(r.state,'tracked');assert.equal(m.starts,1);assert.ok(reads>=2);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+test('malformed recovery response cannot turn into a launch success',async()=>{
+ const {dir,m,input,options}=await setup('timeout');try{
+ const proc=async(b,args,cwd,t)=>args[1]==='request-show'?{exitCode:0,stdout:'{bad-json',stderr:'private'}:m.process(b,args,cwd,t);
+ await assert.rejects(launchOrcaRecoverable(config,input,proc,options),e=>e.receipt.state==='unknown'&&e.receipt.retry_allowed===false);
+ assert.equal(m.starts,1);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
+test('failed dispatch is recoverable identity, not fabricated completion',async()=>{
+ const {dir,m,input,options}=await setup('timeout');try{
+ m.show.worker.state='failed';m.show.dispatch.status='failed';
+ const r=await launchOrcaRecoverable(config,input,m.process,options);
+ assert.equal(r.state,'tracked');assert.equal(r.launch_state,'failed');assert.equal(r.awaited_terminal,false);assert.equal(r.succeeded,undefined);
+ }finally{await fs.rm(dir,{recursive:true,force:true});}
+});
