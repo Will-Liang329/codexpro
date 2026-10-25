@@ -218,3 +218,25 @@ test('failed dispatch is recoverable identity, not fabricated completion',async(
  assert.equal(r.state,'tracked');assert.equal(r.launch_state,'failed');assert.equal(r.awaited_terminal,false);assert.equal(r.succeeded,undefined);
  }finally{await fs.rm(dir,{recursive:true,force:true});}
 });
+
+test('concurrent directory initialization cannot bypass ancestor durability',async()=>{
+ const {AsyncLocalStorage}=await import('node:async_hooks');const ctx=new AsyncLocalStorage();
+ const {dir,m,input,options}=await setup();const original=fs.open, synced=new Map([[1,new Set()],[2,new Set()]]);
+ let release, paused;const gate=new Promise(r=>release=r), reached=new Promise(r=>paused=r);let stopped=false;
+ const chain=[];for(let current=options.journalDir;;current=path.dirname(current)){chain.push(current);if(path.dirname(current)===current)break;}
+ try{
+ fs.open=async function(file,...args){const handle=await original.call(this,file,...args);const caller=ctx.getStore();
+ if(chain.includes(file)&&caller){const sync=handle.sync.bind(handle);handle.sync=async()=>{
+  if(caller===1&&file===dir&&!stopped){stopped=true;paused();await gate;}
+  await sync();synced.get(caller).add(file);
+ };}return handle;};
+ const proc=async(b,args,cwd,t)=>{
+  if(args[1]==='worker-start')assert.ok(chain.every(d=>synced.get(ctx.getStore()).has(d)),'worker before complete ancestor sync');
+  return m.process(b,args,cwd,t);
+ };
+ const first=ctx.run(1,()=>launchOrcaRecoverable(config,input,proc,options));
+ await reached;
+ const second=await ctx.run(2,()=>launchOrcaRecoverable(config,input,proc,options));
+ assert.equal(second.dispatchId,'ctx-test');release();await first;assert.equal(m.starts,1);
+ }finally{release();fs.open=original;await fs.rm(dir,{recursive:true,force:true});}
+});

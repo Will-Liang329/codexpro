@@ -125,14 +125,12 @@ export async function launchOrcaRecoverable(
     }
   };
   try {
-    const firstCreated = await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-    if (firstCreated) {
-      // Persist newly created ancestors as well as the leaf; a synced claim is useless if its directory disappears.
-      const parent = path.dirname(path.resolve(firstCreated));
-      for (let current = path.resolve(dir); ; current = path.dirname(current)) {
-        await syncDirectory(current);
-        if (current === parent) break;
-      }
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    // Another process can observe mkdir before its creator syncs it (or the creator can crash).
+    // Every potential allocator proves the whole chain itself, including previously existing ancestors.
+    for (let current = path.resolve(dir); ; current = path.dirname(current)) {
+      await syncDirectory(current);
+      if (path.dirname(current) === current) break;
     }
     let claim;
     try { claim = await fs.open(file, "wx", 0o600); }

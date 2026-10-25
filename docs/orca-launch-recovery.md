@@ -20,8 +20,10 @@ A private identity journal under `~/.local/state/codexpro/launch-requests` conta
 only a fingerprint, request UUIDs, causal IDs, stage and bounded diagnostics. It
 contains no plan, provider output or credentials. An exclusive file creation
 claims each key across MCP processes; checkpoints use fsync and atomic rename.
-Claim creation, checkpoint replacement and newly created directory ancestors are
-synced before proceeding. Filesystems/platforms that reject directory fsync fail
+Claim creation and checkpoint replacement are synced before proceeding. Each
+potential allocator syncs the full directory chain to the filesystem root, even
+when another caller already created it, so concurrent initialization cannot skip
+still-unflushed ancestor metadata. Filesystems/platforms that reject directory fsync fail
 closed before any new allocation; they are not supported for durable launch.
 Claims are never stolen by timeout, PID or age, including after restart. Preserve
 this directory: deleting identity records destroys the duplicate fence. Local
